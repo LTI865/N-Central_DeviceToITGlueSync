@@ -1,0 +1,74 @@
+{
+  "_comment": "Copy this file to NCentralITGlueDeviceSync.config.json next to the script and fill it in. Keys starting with _ are ignored. Secrets (N-central token, IT Glue key, passwords) do NOT go in this file.",
+
+  "ITGlueBaseUrl": "https://api.itglue.com",
+  "DataFolder": "C:\\ProgramData\\NCentralITGlueDeviceSync",
+
+  "NCentral": {
+    "_comment": "ServerUrl is just the https address of N-central. AssetDetails reads serial number, make, model, OS, MAC and IP per device (one API call each, cached AssetRefreshHours, at most MaxAssetLookupsPerRun per run). Exclude* take N-central ids (or customer names) to leave out on purpose, e.g. your own internal customer.",
+    "ServerUrl": "https://ncentral.example.com",
+    "PageSize": 500,
+    "AssetDetails": true,
+    "AssetRefreshHours": 24,
+    "MaxAssetLookupsPerRun": 300,
+    "IncludeProbes": false,
+    "SkipDevicesNotSeenDays": 0,
+    "ExcludeCustomerIds": [],
+    "ExcludeCustomerNames": [],
+    "ExcludeSiteIds": [],
+    "ExcludeDeviceIds": []
+  },
+
+  "SkipOrgStatus": ["Inactive"],
+  "SkipOrgType": [],
+  "ExcludeOrganizationIds": [],
+
+  "CustomerNameMap": {
+    "_comment": "Only for a customer whose names can't be made the same: \"N-central customer name\": \"IT Glue organization name\". Leave empty so every name must match exactly."
+  },
+
+  "DeviceClassMap": [
+    { "Match": "server", "ConfigurationType": "Server" },
+    { "Match": "laptop", "ConfigurationType": "Laptop" },
+    { "Match": "workstation|desktop", "ConfigurationType": "Workstation" }
+  ],
+
+  "IgnoreSerials": ["To Be Filled By O.E.M.", "System Serial Number", "Default string", "None", "Not Specified", "Not Applicable", "N/A", "INVALID", "Chassis Serial Number", "Base Board Serial Number", "0", "00000000", "0123456789", "123456789"],
+
+  "Sync": {
+    "_comment": "UpdateFields: what the sync keeps equal to N-central on existing configurations (name, hostname, serial-number, configuration-type, location, operating-system-notes, manufacturer, model, mac-address, primary-ip). New configurations get everything. RetiredDeviceAction: Report (default) or SetStatus (sets RetiredStatus). BlockAllOnMismatch true = make no changes at all while any device doesn't match a customer/site.",
+    "ConfigurationStatus": "Active",
+    "UpdateFields": ["name", "hostname", "serial-number", "configuration-type", "location", "operating-system-notes", "manufacturer", "model"],
+    "MaxChangesPerRun": 100,
+    "MatchByName": true,
+    "BlockAllOnMismatch": false,
+    "RetiredDeviceAction": "Report",
+    "RetiredStatus": "Inactive",
+    "MaxRetiresPerRun": 10,
+    "MaxRetries": 3,
+    "DelayMsBetweenWrites": 250
+  },
+
+  "ReminderHours": 24,
+  "NotifyOnResolved": true,
+  "MaxItemsPerCheck": 50,
+  "LogRetentionDays": 30,
+
+  "NotificationMethods": ["Smtp"],
+
+  "Smtp": {
+    "Server": "smtp.example.com",
+    "Port": 587,
+    "UseSsl": true,
+    "From": "device-sync@example.com",
+    "To": ["helpdesk-leads@example.com"],
+    "Username": "",
+    "SubjectPrefix": "[N-central > IT Glue]"
+  },
+
+  "Webhook": {
+    "_comment": "Only used when NotificationMethods includes \"Webhook\". Receives a JSON POST.",
+    "Url": "",
+    "SecretHeaderName": ""
+  }
+}
