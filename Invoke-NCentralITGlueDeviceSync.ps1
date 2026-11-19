@@ -108,7 +108,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.1'
+$ScriptVersion = '0.2'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -612,7 +612,8 @@ function Get-ITGlueAll {
     $page = 1
     $expectedPages = $null; $expectedCount = $null
     while ($true) {
-        $resp = Invoke-ITGlueGet -Uri "$BaseUrl$Path`?page[size]=1000&page[number]=$page"
+        $sep = '?'; if ($Path.Contains('?')) { $sep = '&' }
+        $resp = Invoke-ITGlueGet -Uri "$BaseUrl$Path${sep}page[size]=1000&page[number]=$page"
         if (-not $resp.meta -or
             -not $resp.meta.PSObject.Properties['total-pages'] -or -not $resp.meta.PSObject.Properties['total-count'] -or
             $null -eq $resp.meta.'total-pages' -or $null -eq $resp.meta.'total-count') {
@@ -671,6 +672,28 @@ function Get-Attr {
     $v = $Rec.attributes.$Prop
     if ($null -eq $v) { return '' }
     return [string]$v
+}
+# Asks IT Glue directly (archived included) whether a configuration with this serial number
+# (any organization) or this name/hostname (this organization) exists. Returns '' when none.
+function Find-ITGlueDuplicateNow {
+    param([string]$OrgId, [string]$Name, [string]$Hostname, [string]$Serial)
+    $found = @()
+    $names = @(@($Name, $Hostname) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)
+    $queries = @()
+    if ($Serial) { $queries += "filter[serial_number]=$([Uri]::EscapeDataString($Serial))" }
+    foreach ($n in @(@($Name, $Hostname) | Where-Object { $_ } | Select-Object -Unique)) { $queries += "filter[organization_id]=$OrgId&filter[name]=$([Uri]::EscapeDataString($n))" }
+    foreach ($q in $queries) {
+        foreach ($arch in 'false', 'true') {
+            $r = Invoke-ITGlueGet -Uri "$BaseUrl/configurations?$q&filter[archived]=$arch&page[size]=50"
+            foreach ($x in @($r.data | Where-Object { $_ })) {
+                # Compare exactly here, in case IT Glue's filter matches partly.
+                $sameSerial = $Serial -and (Get-SerialKey (Get-Attr $x 'serial-number')) -eq (Get-SerialKey $Serial)
+                $sameName = (Get-Attr $x 'organization-id') -eq $OrgId -and (($names -contains (Get-NameKey (Get-Attr $x 'name'))) -or ((Get-Attr $x 'hostname') -and $names -contains (Get-NameKey (Get-Attr $x 'hostname'))))
+                if ($sameSerial -or $sameName) { $found += "'$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
+            }
+        }
+    }
+    return ((@($found | Select-Object -Unique)) -join '; ')
 }
 function Get-NameKey { param([string]$S) return ($S -replace '\s+', ' ').Trim().ToLowerInvariant() }
 function Get-SerialKey { param([string]$S) return ($S -replace '\s+', '').ToUpperInvariant() }
@@ -768,11 +791,28 @@ function Invoke-DeviceSync {
     $orgs = Get-ITGlueAll '/organizations'
     $locs = Get-ITGlueAll '/locations'
     $confs = Get-ITGlueAll '/configurations'
+    # Archived configurations count for duplicate checks too (a device is never created again
+    # next to an archived copy of itself).
+    $archived = @()
+    try { $archived = Get-ITGlueAll '/configurations?filter[archived]=true' }
+    catch { throw "Couldn't read archived IT Glue configurations, so duplicates can't be ruled out: $($_.Exception.Message)" }
+    $haveIds = @{}; foreach ($c in $confs) { $haveIds[[string]$c.id] = $true }
+    $archivedOnly = @($archived | Where-Object { -not $haveIds.ContainsKey([string]$_.id) })
     $types = Get-ITGlueAll '/configuration_types'
     $statuses = Get-ITGlueAll '/configuration_statuses'
     $mfrs = Get-ITGlueAll '/manufacturers'
     $models = Get-ITGlueAll '/models'
-    Write-Log "IT Glue: $($orgs.Count) organizations, $($locs.Count) locations, $($confs.Count) configurations."
+    Write-Log "IT Glue: $($orgs.Count) organizations, $($locs.Count) locations, $($confs.Count) configurations (+$($archivedOnly.Count) archived)."
+    # Evidence of another integration already writing configurations (PSA/RMM-linked records).
+    $byIntegration = @{}
+    foreach ($c in $confs) {
+        foreach ($f in 'rmm-integration-type', 'psa-integration-type', 'psa-integration') {
+            $v = Get-Attr $c $f
+            if ($v) { $k = "$f=$v"; if (-not $byIntegration.ContainsKey($k)) { $byIntegration[$k] = 0 }; $byIntegration[$k]++ }
+        }
+    }
+    if ($byIntegration.Count -gt 0) { Write-Log ("IT Glue configurations linked to another integration: {0}. Make sure that integration isn't also syncing N-central devices." -f ((@($byIntegration.Keys | Sort-Object | ForEach-Object { "$_ ($($byIntegration[$_]))" })) -join ', ')) 'WARN' }
+    else { Write-Log 'No IT Glue configurations are linked to an RMM or PSA integration.' }
 
     $typeIds = @{}; foreach ($t in $types) { $typeIds[(Get-NameKey (Get-Attr $t 'name'))] = [string]$t.id }
     foreach ($m in $classMap) { if (-not $typeIds.ContainsKey((Get-NameKey $m.Type))) { throw "IT Glue has no configuration type named '$($m.Type)' (DeviceClassMap). Types: $((@($types | ForEach-Object { Get-Attr $_ 'name' }) | Sort-Object) -join ', ')" } }
@@ -803,6 +843,19 @@ function Invoke-DeviceSync {
         $oid = Get-Attr $l 'organization-id'
         if (-not $locsByOrg.ContainsKey($oid)) { $locsByOrg[$oid] = New-Object System.Collections.ArrayList }
         $null = $locsByOrg[$oid].Add($l)
+    }
+    # Every configuration, archived too, by serial number (any organization) and by organization + name.
+    # Used to make sure nothing is created or renamed into a duplicate.
+    $anyBySerial = @{}; $anyByOrgName = @{}
+    foreach ($c in @($confs) + @($archivedOnly)) {
+        $sk = Get-SerialKey (Get-Attr $c 'serial-number')
+        if ($sk -and -not $ignoreSerial.ContainsKey($sk)) { if (-not $anyBySerial.ContainsKey($sk)) { $anyBySerial[$sk] = New-Object System.Collections.ArrayList }; $null = $anyBySerial[$sk].Add($c) }
+        $oid = Get-Attr $c 'organization-id'
+        foreach ($n in @(@((Get-Attr $c 'name'), (Get-Attr $c 'hostname')) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)) {
+            $k = "$oid|$n"
+            if (-not $anyByOrgName.ContainsKey($k)) { $anyByOrgName[$k] = New-Object System.Collections.ArrayList }
+            $null = $anyByOrgName[$k].Add($c)
+        }
     }
     $confById = @{}; $confsBySerial = @{}; $confsByOrgName = @{}
     foreach ($c in $confs) {
@@ -958,6 +1011,24 @@ function Invoke-DeviceSync {
         }
     }
 
+    # ---------- 5b. Duplicate device names in one IT Glue organization: newest check-in wins ----------
+    $byName = @{}
+    foreach ($c in $candidates) {
+        if ($dupLosers.ContainsKey($c.Id)) { continue }
+        $k = "$($c.OrgId)|$(Get-NameKey $c.Name)"
+        if (-not $byName.ContainsKey($k)) { $byName[$k] = New-Object System.Collections.ArrayList }
+        $null = $byName[$k].Add($c)
+    }
+    foreach ($k in $byName.Keys) {
+        $g = @($byName[$k])
+        if ($g.Count -lt 2) { continue }
+        $sorted = @($g | Sort-Object @{ Expression = { $t = ConvertFrom-Utc $_.LastSeen; if ($t) { $t } else { [DateTime]::MinValue } }; Descending = $true })
+        foreach ($l in ($sorted | Select-Object -Skip 1)) {
+            $dupLosers[$l.Id] = $true
+            Add-Failure 'DeviceConflict' "ncdupname:$($l.Id)" $l.CustName $l.Name "Same name as N-central device id $($sorted[0].Id) in the same customer, which checked in more recently and is synced instead. Remove the old device from N-central or rename one."
+        }
+    }
+
     # ---------- 6. Match each device to an IT Glue configuration and plan changes ----------
     $plan = New-Object System.Collections.ArrayList
     $claimed = @{}   # IT Glue configuration id -> N-central id, within this run
@@ -1033,6 +1104,22 @@ function Invoke-DeviceSync {
 
         $fieldFor = @{ 'name' = 'name'; 'hostname' = 'hostname'; 'serial-number' = 'serial-number'; 'configuration-type-id' = 'configuration-type'; 'location-id' = 'location'; 'operating-system-notes' = 'operating-system-notes'; 'mac-address' = 'mac-address'; 'primary-ip' = 'primary-ip'; 'manufacturer-id' = 'manufacturer'; 'model-id' = 'model' }
         if (-not $conf) {
+            # Never create a duplicate: no configuration (archived included, linked to another device
+            # or not) may already have this serial number anywhere, or this name/hostname in this organization.
+            $dupWhy = @()
+            if ($c.SerialKey -and $anyBySerial.ContainsKey($c.SerialKey)) {
+                foreach ($x in $anyBySerial[$c.SerialKey]) { $dupWhy += "serial $($c.Serial) is on '$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name')$(if ((Get-Attr $x 'archived') -eq 'True') { ', archived' }))" }
+            }
+            foreach ($n in @(@($c.Name, $want['hostname']) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)) {
+                if ($anyByOrgName.ContainsKey("$($c.OrgId)|$n")) {
+                    foreach ($x in $anyByOrgName["$($c.OrgId)|$n"]) { $dupWhy += "name '$n' is on id $($x.id)$(if ((Get-Attr $x 'archived') -eq 'True') { ' (archived)' }) with serial '$(Get-Attr $x 'serial-number')'" }
+                }
+            }
+            if ($dupWhy.Count -gt 0) {
+                $stats.conflicts++
+                Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not created, it would be a duplicate: $((@($dupWhy | Select-Object -Unique)) -join '; '). Fix the serial/name, or unarchive or merge in IT Glue." (Get-Attr $c.Org 'resource-url')
+                continue
+            }
             $attrs = @{ 'organization-id' = [int64]$c.OrgId; 'configuration-status-id' = [int64]$newStatusId }
             foreach ($f in $want.Keys) { if ($want[$f]) { if ($f -like '*-id') { $attrs[$f] = [int64]$want[$f] } else { $attrs[$f] = [string]$want[$f] } } }
             $stats.toCreate++
@@ -1053,6 +1140,22 @@ function Invoke-DeviceSync {
                 if ($f -like '*-id') { $attrs[$f] = [int64]$want[$f] } else { $attrs[$f] = [string]$want[$f] }
                 $changes += "$($fieldFor[$f]): '$have' -> '$($want[$f])'"
             }
+        }
+        # Never rename or re-serial a configuration into a duplicate of another one.
+        $dupWhy = @()
+        foreach ($f in 'name', 'hostname') {
+            if (-not $attrs.ContainsKey($f)) { continue }
+            $others = @(); $nk = "$($c.OrgId)|$(Get-NameKey ([string]$attrs[$f]))"
+            if ($anyByOrgName.ContainsKey($nk)) { $others = @($anyByOrgName[$nk] | Where-Object { [string]$_.id -ne [string]$conf.id }) }
+            if ($others.Count -gt 0) { $dupWhy += "$f '$($attrs[$f])' is already on id $((@($others | ForEach-Object { $_.id })) -join ', ')"; $attrs.Remove($f); $changes = @($changes | Where-Object { -not $_.StartsWith("${f}:") }) }
+        }
+        if ($attrs.ContainsKey('serial-number')) {
+            $others = @(); $sk = Get-SerialKey ([string]$attrs['serial-number'])
+            if ($anyBySerial.ContainsKey($sk)) { $others = @($anyBySerial[$sk] | Where-Object { [string]$_.id -ne [string]$conf.id }) }
+            if ($others.Count -gt 0) { $dupWhy += "serial $($attrs['serial-number']) is already on id $((@($others | ForEach-Object { $_.id })) -join ', ')"; $attrs.Remove('serial-number'); $changes = @($changes | Where-Object { -not $_.StartsWith('serial-number:') }) }
+        }
+        if ($dupWhy.Count -gt 0) {
+            Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not changed, it would make a duplicate: $($dupWhy -join '; ')." (Get-Attr $conf 'resource-url')
         }
         if ($changes.Count -eq 0) {
             $stats.inSync++
@@ -1123,6 +1226,9 @@ function Invoke-DeviceSync {
             $done++
             try {
                 if ($p.action -eq 'create') {
+                    # Last check against IT Glue as it is now, in case someone added the device since it was read.
+                    $dupNow = Find-ITGlueDuplicateNow -OrgId $p.orgId -Name ([string]$p.attributes['name']) -Hostname ([string]$p.attributes['hostname']) -Serial ([string]$p.attributes['serial-number'])
+                    if ($dupNow) { throw "Not created, IT Glue now has a duplicate: $dupNow" }
                     $r = Invoke-ITGlueWrite -Method POST -Path '/configurations' -Attributes $p.attributes
                     $newId = [string]$r.data.id
                     if (-not $newId) { throw 'IT Glue answered without the new configuration id.' }

@@ -12,7 +12,7 @@ sites and contacts, so this script **never creates, renames or changes an IT Glu
 or location**. It only creates and updates IT Glue Configurations, and it never deletes or
 archives anything.
 
-> **Status: v0.1, not yet tested against live N-central or IT Glue.** The N-central field names
+> **Status: v0.2, not yet tested against live N-central or IT Glue.** The N-central field names
 > (especially the hardware details from `/api/devices/{id}/assets`) are based on N-able's API
 > documentation and need checking on the first dry run. Follow "First run" below.
 
@@ -45,7 +45,7 @@ internal one), use `NCentral.ExcludeCustomerIds` or `ExcludeCustomerNames`.
 |---|-------|-------|
 | 1 | Customer | N-central customer has no IT Glue organization with that name (or more than one), or the device is at service-organization level. |
 | 2 | Site | N-central site has no IT Glue location with that name in the matched organization, or the device has no site and the organization doesn't have exactly one location. |
-| 3 | Can't match safely | Two N-central devices with the same serial (the older one is skipped and the newest check-in wins); several IT Glue configurations with the same serial or name; the serial is on a configuration under a **different** organization; the device moved customer in N-central; or IT Glue keeps ignoring an update after `MaxRetries` (3). Nothing is changed for these. |
+| 3 | Can't match safely | Creating or renaming would make a duplicate (see "No duplicates"); two N-central devices with the same serial or name (the older one is skipped and the newest check-in wins); several IT Glue configurations with the same serial or name; the serial is on a configuration under a **different** organization; the device moved customer in N-central; or IT Glue keeps ignoring an update after `MaxRetries` (3). Nothing is changed for these. |
 | 4 | IT Glue refused | A create or update was refused (with IT Glue's error). Retried next run. |
 | 5 | Gone from N-central | A device synced before is no longer in N-central. Report only by default; `RetiredDeviceAction: "SetStatus"` sets its status to `RetiredStatus` instead. |
 
@@ -76,6 +76,28 @@ What's written:
 A value that is blank in N-central never clears IT Glue. The organization of an existing
 configuration is never changed. Devices whose class isn't in `DeviceClassMap` (printers, network
 devices, probes...) are skipped.
+
+## No duplicates
+
+The script never creates a duplicate Configuration, and never renames one into a duplicate.
+Before **creating** a device it checks every IT Glue configuration, **archived ones included**:
+
+- **Serial number:** no configuration anywhere in IT Glue (any organization) may already have it.
+- **Name / hostname:** no configuration in that organization may already have it.
+- Right before the create call, it asks IT Glue again (by serial number and by name), in case
+  someone added the device since the run started.
+
+If any check finds something, the device is **not created** and the match is listed in the alert
+(check 3), with the existing configuration's id, so a person can fix it. Updates follow the same
+rule: a name, hostname or serial number change that would match another configuration is left out.
+
+Duplicates inside N-central are caught too. Two N-central devices with the same serial number,
+or the same name in the same customer, are reported; only the one that checked in most recently
+is synced.
+
+**Is something else already syncing devices into IT Glue?** Each run logs how many IT Glue
+configurations are linked to an RMM or PSA integration (`rmm-integration-type`,
+`psa-integration-type`). Zero means nothing else is managing them.
 
 ## Safety
 
