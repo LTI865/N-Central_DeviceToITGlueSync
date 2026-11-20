@@ -12,7 +12,7 @@ sites and contacts, so this script **never creates, renames or changes an IT Glu
 or location**. It only creates and updates IT Glue Configurations, and it never deletes or
 archives anything.
 
-> **Status: v0.2, not yet tested against live N-central or IT Glue.** The N-central field names
+> **Status: v0.3, not yet tested against live N-central or IT Glue.** The N-central field names
 > (especially the hardware details from `/api/devices/{id}/assets`) are based on N-able's API
 > documentation and need checking on the first dry run. Follow "First run" below.
 
@@ -80,12 +80,20 @@ devices, probes...) are skipped.
 ## No duplicates
 
 The script never creates a duplicate Configuration, and never renames one into a duplicate.
-Before **creating** a device it checks every IT Glue configuration, **archived ones included**:
+Before **creating** a device it checks every **non-archived** IT Glue configuration:
 
-- **Serial number:** no configuration anywhere in IT Glue (any organization) may already have it.
-- **Name / hostname:** no configuration in that organization may already have it.
-- Right before the create call, it asks IT Glue again (by serial number and by name), in case
-  someone added the device since the run started.
+- **Serial number:** no non-archived configuration anywhere in IT Glue (any organization) may
+  already have it.
+- **Name / hostname:** no non-archived configuration in that organization may already have it.
+- Right before the create call, it asks IT Glue again (by serial number and by name, non-archived
+  only), in case someone added the device since the run started.
+
+**Archived configurations don't count.** N-central is the source of truth for devices and IT Glue
+is only documentation, so an archived IT Glue record is ignored everywhere: it is never matched,
+never blocks a create, never triggers a "can't match safely" alert, and is never changed or
+unarchived. If a device is in N-central and its only IT Glue record is archived, the script
+creates a new Configuration for it. (If the archived record was the one it was linked to before,
+the link is dropped and the device is matched or created again like a new one.)
 
 If any check finds something, the device is **not created** and the match is listed in the alert
 (check 3), with the existing configuration's id, so a person can fix it. Updates follow the same
@@ -131,6 +139,8 @@ Exit codes: 0 all matched, 1 devices skipped because of a problem, 2 couldn't ru
 3 alert couldn't be sent, 4 IT Glue refused a change or the retire limit was hit.
 
 ## Setup
+
+> **Full step-by-step guide for anyone setting this up:** [SETUP-INSTRUCTIONS.md](SETUP-INSTRUCTIONS.md).
 
 Windows PowerShell 5.1 or PowerShell 7+, no modules. Same layout as the health monitor, for
 example `C:\LTI\NCentralITGlueDeviceSync`, running as the same service account.

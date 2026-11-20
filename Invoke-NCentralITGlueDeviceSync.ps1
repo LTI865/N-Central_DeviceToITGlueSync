@@ -26,7 +26,10 @@
       4. Matches the device to an existing IT Glue Configuration: the one it was linked to
          before (sync-state.json), else the same serial number in that organization, else the
          same name/hostname in that organization (only if the serial numbers don't disagree).
-         Anything ambiguous is reported (check 3) and left alone.
+         Anything ambiguous is reported (check 3) and left alone. Archived IT Glue
+         Configurations are ignored completely: they are never matched, never count as a
+         duplicate and are never changed. A device whose only IT Glue record is archived gets
+         a new Configuration.
       5. Plans the changes: create missing Configurations, update fields that differ
          (Sync.UpdateFields). A value that is blank in N-central never clears IT Glue.
       6. With -Apply only: makes at most Sync.MaxChangesPerRun changes (the rest go on the
@@ -108,7 +111,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.2'
+$ScriptVersion = '0.3'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -673,8 +676,9 @@ function Get-Attr {
     if ($null -eq $v) { return '' }
     return [string]$v
 }
-# Asks IT Glue directly (archived included) whether a configuration with this serial number
-# (any organization) or this name/hostname (this organization) exists. Returns '' when none.
+# Asks IT Glue directly whether a non-archived configuration with this serial number (any
+# organization) or this name/hostname (this organization) exists. Returns '' when none.
+# Archived configurations are ignored: N-central is the source of truth for devices.
 function Find-ITGlueDuplicateNow {
     param([string]$OrgId, [string]$Name, [string]$Hostname, [string]$Serial)
     $found = @()
@@ -683,14 +687,13 @@ function Find-ITGlueDuplicateNow {
     if ($Serial) { $queries += "filter[serial_number]=$([Uri]::EscapeDataString($Serial))" }
     foreach ($n in @(@($Name, $Hostname) | Where-Object { $_ } | Select-Object -Unique)) { $queries += "filter[organization_id]=$OrgId&filter[name]=$([Uri]::EscapeDataString($n))" }
     foreach ($q in $queries) {
-        foreach ($arch in 'false', 'true') {
-            $r = Invoke-ITGlueGet -Uri "$BaseUrl/configurations?$q&filter[archived]=$arch&page[size]=50"
-            foreach ($x in @($r.data | Where-Object { $_ })) {
-                # Compare exactly here, in case IT Glue's filter matches partly.
-                $sameSerial = $Serial -and (Get-SerialKey (Get-Attr $x 'serial-number')) -eq (Get-SerialKey $Serial)
-                $sameName = (Get-Attr $x 'organization-id') -eq $OrgId -and (($names -contains (Get-NameKey (Get-Attr $x 'name'))) -or ((Get-Attr $x 'hostname') -and $names -contains (Get-NameKey (Get-Attr $x 'hostname'))))
-                if ($sameSerial -or $sameName) { $found += "'$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
-            }
+        $r = Invoke-ITGlueGet -Uri "$BaseUrl/configurations?$q&filter[archived]=false&page[size]=50"
+        foreach ($x in @($r.data | Where-Object { $_ })) {
+            if ((Get-Attr $x 'archived') -eq 'True') { continue }
+            # Compare exactly here, in case IT Glue's filter matches partly.
+            $sameSerial = $Serial -and (Get-SerialKey (Get-Attr $x 'serial-number')) -eq (Get-SerialKey $Serial)
+            $sameName = (Get-Attr $x 'organization-id') -eq $OrgId -and (($names -contains (Get-NameKey (Get-Attr $x 'name'))) -or ((Get-Attr $x 'hostname') -and $names -contains (Get-NameKey (Get-Attr $x 'hostname'))))
+            if ($sameSerial -or $sameName) { $found += "'$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
         }
     }
     return ((@($found | Select-Object -Unique)) -join '; ')
@@ -790,19 +793,14 @@ function Invoke-DeviceSync {
     Write-Log "Reading IT Glue at $BaseUrl ..."
     $orgs = Get-ITGlueAll '/organizations'
     $locs = Get-ITGlueAll '/locations'
-    $confs = Get-ITGlueAll '/configurations'
-    # Archived configurations count for duplicate checks too (a device is never created again
-    # next to an archived copy of itself).
-    $archived = @()
-    try { $archived = Get-ITGlueAll '/configurations?filter[archived]=true' }
-    catch { throw "Couldn't read archived IT Glue configurations, so duplicates can't be ruled out: $($_.Exception.Message)" }
-    $haveIds = @{}; foreach ($c in $confs) { $haveIds[[string]$c.id] = $true }
-    $archivedOnly = @($archived | Where-Object { -not $haveIds.ContainsKey([string]$_.id) })
+    # Archived configurations are ignored everywhere (matching, duplicate checks, alerts) and never
+    # changed. N-central is the source of truth for devices; an archived IT Glue record doesn't count.
+    $confs = @(Get-ITGlueAll '/configurations?filter[archived]=false' | Where-Object { (Get-Attr $_ 'archived') -ne 'True' })
     $types = Get-ITGlueAll '/configuration_types'
     $statuses = Get-ITGlueAll '/configuration_statuses'
     $mfrs = Get-ITGlueAll '/manufacturers'
     $models = Get-ITGlueAll '/models'
-    Write-Log "IT Glue: $($orgs.Count) organizations, $($locs.Count) locations, $($confs.Count) configurations (+$($archivedOnly.Count) archived)."
+    Write-Log "IT Glue: $($orgs.Count) organizations, $($locs.Count) locations, $($confs.Count) configurations (archived ones ignored)."
     # Evidence of another integration already writing configurations (PSA/RMM-linked records).
     $byIntegration = @{}
     foreach ($c in $confs) {
@@ -844,10 +842,10 @@ function Invoke-DeviceSync {
         if (-not $locsByOrg.ContainsKey($oid)) { $locsByOrg[$oid] = New-Object System.Collections.ArrayList }
         $null = $locsByOrg[$oid].Add($l)
     }
-    # Every configuration, archived too, by serial number (any organization) and by organization + name.
-    # Used to make sure nothing is created or renamed into a duplicate.
+    # Every non-archived configuration (linked to a device or not) by serial number (any organization)
+    # and by organization + name. Used to make sure nothing is created or renamed into a duplicate.
     $anyBySerial = @{}; $anyByOrgName = @{}
-    foreach ($c in @($confs) + @($archivedOnly)) {
+    foreach ($c in $confs) {
         $sk = Get-SerialKey (Get-Attr $c 'serial-number')
         if ($sk -and -not $ignoreSerial.ContainsKey($sk)) { if (-not $anyBySerial.ContainsKey($sk)) { $anyBySerial[$sk] = New-Object System.Collections.ArrayList }; $null = $anyBySerial[$sk].Add($c) }
         $oid = Get-Attr $c 'organization-id'
@@ -1104,20 +1102,20 @@ function Invoke-DeviceSync {
 
         $fieldFor = @{ 'name' = 'name'; 'hostname' = 'hostname'; 'serial-number' = 'serial-number'; 'configuration-type-id' = 'configuration-type'; 'location-id' = 'location'; 'operating-system-notes' = 'operating-system-notes'; 'mac-address' = 'mac-address'; 'primary-ip' = 'primary-ip'; 'manufacturer-id' = 'manufacturer'; 'model-id' = 'model' }
         if (-not $conf) {
-            # Never create a duplicate: no configuration (archived included, linked to another device
-            # or not) may already have this serial number anywhere, or this name/hostname in this organization.
+            # Never create a duplicate: no non-archived configuration (linked to another device or not)
+            # may already have this serial number anywhere, or this name/hostname in this organization.
             $dupWhy = @()
             if ($c.SerialKey -and $anyBySerial.ContainsKey($c.SerialKey)) {
-                foreach ($x in $anyBySerial[$c.SerialKey]) { $dupWhy += "serial $($c.Serial) is on '$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name')$(if ((Get-Attr $x 'archived') -eq 'True') { ', archived' }))" }
+                foreach ($x in $anyBySerial[$c.SerialKey]) { $dupWhy += "serial $($c.Serial) is on '$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
             }
             foreach ($n in @(@($c.Name, $want['hostname']) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)) {
                 if ($anyByOrgName.ContainsKey("$($c.OrgId)|$n")) {
-                    foreach ($x in $anyByOrgName["$($c.OrgId)|$n"]) { $dupWhy += "name '$n' is on id $($x.id)$(if ((Get-Attr $x 'archived') -eq 'True') { ' (archived)' }) with serial '$(Get-Attr $x 'serial-number')'" }
+                    foreach ($x in $anyByOrgName["$($c.OrgId)|$n"]) { $dupWhy += "name '$n' is on id $($x.id) with serial '$(Get-Attr $x 'serial-number')'" }
                 }
             }
             if ($dupWhy.Count -gt 0) {
                 $stats.conflicts++
-                Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not created, it would be a duplicate: $((@($dupWhy | Select-Object -Unique)) -join '; '). Fix the serial/name, or unarchive or merge in IT Glue." (Get-Attr $c.Org 'resource-url')
+                Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not created, it would be a duplicate: $((@($dupWhy | Select-Object -Unique)) -join '; '). Fix the serial/name, or merge or archive the existing one in IT Glue." (Get-Attr $c.Org 'resource-url')
                 continue
             }
             $attrs = @{ 'organization-id' = [int64]$c.OrgId; 'configuration-status-id' = [int64]$newStatusId }
@@ -1180,7 +1178,7 @@ function Invoke-DeviceSync {
         foreach ($nid in @($Sync.links.Keys)) {
             if ($liveIds.ContainsKey($nid)) { continue }
             $lk = $Sync.links[$nid]
-            if ($lk -isnot [hashtable] -or -not $confById.ContainsKey([string]$lk.itg)) { $Sync.links.Remove($nid); continue }   # archived or deleted in IT Glue: done
+            if ($lk -isnot [hashtable] -or -not $confById.ContainsKey([string]$lk.itg)) { $Sync.links.Remove($nid); continue }   # archived or deleted in IT Glue: forget the link (archived records are ignored)
             $conf = $confById[[string]$lk.itg]
             if ($lk.retiredUtc -and (Get-Attr $conf 'configuration-status-id') -eq [string]$retiredStatusId) { continue }
             $stats.removed++
