@@ -132,7 +132,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.5'
+$ScriptVersion = '0.6'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -1046,7 +1046,11 @@ function Invoke-DeviceSync {
     $locs = Get-ITGlueAll '/locations'
     # Archived configurations are ignored everywhere (matching, duplicate checks, alerts) and never
     # changed. N-central is the source of truth for devices; an archived IT Glue record doesn't count.
-    $confs = @(Get-ITGlueAll '/configurations?filter[archived]=false' | Where-Object { (Get-Attr $_ 'archived') -ne 'True' })
+    # Assign first: Get-ITGlueAll returns its list as ONE object (return , $array), so piping the call
+    # straight into Where-Object would filter the whole list as a single item (v0.3/v0.4 bug).
+    $allConfs = Get-ITGlueAll '/configurations?filter[archived]=false'
+    $confs = @($allConfs | Where-Object { (Get-Attr $_ 'archived') -ne 'True' })
+    foreach ($c in $confs) { if ([string]$c.id -notmatch '^\d+$') { throw "IT Glue configuration list was read wrongly (an entry has id '$([string]$c.id)'). Nothing was changed." } }
     $types = Get-ITGlueAll '/configuration_types'
     $statuses = Get-ITGlueAll '/configuration_statuses'
     $mfrs = Get-ITGlueAll '/manufacturers'
