@@ -12,7 +12,7 @@ sites and contacts, so this script **never creates, renames or changes an IT Glu
 or location**. It only creates and updates IT Glue Configurations, and it never deletes or
 archives anything.
 
-> **Status: v0.9, not yet tested against live N-central or IT Glue.** The N-central field names
+> **Status: v0.10, not yet tested against live N-central or IT Glue.** The N-central field names
 > (especially the hardware details from `/api/devices/{id}/assets`) are based on N-able's API
 > documentation and need checking on the first dry run. Follow "First run" below. The optional
 > local AI model mode (v0.4) has not been run against Ollama yet either.
@@ -149,8 +149,17 @@ slowest, because nothing is cached yet; later runs only ask about new or changed
 the model gets at most `MaxCallsPerRun` (100) new questions, of which at most
 `MaxArchiveCallsPerRun` (20) are archive suggestions, and at most `MaxMinutesPerRun` (10) minutes;
 the rest wait for the next run. `KeepAlive` (30m) keeps the model loaded between questions;
-`ContextTokens` (4096) is enough for these prompts. If the log warns that the model is
-"thinking", set `Think` to false. Every question is logged with its time
+`ContextTokens` (4096) is enough for these prompts. `Think` is false by default: models like
+Gemma 4 otherwise write thousands of words of "thinking" before each answer, which took ~40 s per
+question in testing and pushed the JSON answer past the context window. Each answer is capped in
+length (`num_predict`), a call that gets no answer within `TimeoutSec` is stopped (hard timeout),
+and an answer that isn't valid JSON is asked again once before the devices fall back to normal
+matching. `MaxMinutesPerRun` counts time spent waiting for the model only. When the limit is
+reached the log says so once; the remaining devices are held until the next run.
+
+Names are compared as they are, without notes in brackets or words like "New"/"old", and by their
+leading asset tag (`DR-DT-24 (Brad Sharp) New` is compared as `DR-DT-24` too), so a renamed device
+isn't skipped as "no similar names". Every question is logged with its time
 (`Local AI (match) ...: 8.4s (model load ..., reading the question ..., writing the answer ...)`).
 
 Model confidence numbers are not well calibrated. Run report-only (or `-DryRun -UseLocalModel`)

@@ -4,7 +4,7 @@ Step-by-step guide to installing and configuring the N-central to IT Glue device
 sync computer. You don't need to know anything about the script beforehand. Do the parts in order
 and don't skip the tests.
 
-> **Status:** version 0.9. The script has **not been fully tested against live N-central and
+> **Status:** version 0.10. The script has **not been fully tested against live N-central and
 > IT Glue yet.** That is why setup goes through a dry run, then a one-device test, then a
 > report-only task, before it is allowed to change anything.
 

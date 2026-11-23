@@ -134,7 +134,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.9'
+$ScriptVersion = '0.10'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -208,7 +208,7 @@ $Defaults = [ordered]@{
         Enabled = $false; Mode = 'Batch'; BatchSize = 25; BatchCandidatesPerDevice = 5; MaxContextTokens = 32768; Endpoint = 'http://localhost:11434'; Model = 'gemma4:12b'; AllowRemoteEndpoint = $false
         AutoLink = $true; AutoLinkConfidence = 90; ReviewConfidence = 60; MinNameSimilarity = 0.3; MaxCandidates = 15
         SuggestArchive = $true; TimeoutSec = 180; MaxCallsPerRun = 100; MaxArchiveCallsPerRun = 20; MaxMinutesPerRun = 10; CacheHours = 336
-        ContextTokens = 4096; KeepAlive = '30m'; Think = $null
+        ContextTokens = 4096; KeepAlive = '30m'; Think = $false
         ApprovedMatches = @{}; RejectedMatches = @{}; KeepConfigurationIds = @()
     }
     ReminderHours          = 24
@@ -854,7 +854,8 @@ $LmBase = ([string]$Lm.Endpoint).Trim().TrimEnd('/')
 $AiLogPath = Join-Path $LogFolder ("ai-{0}.jsonl" -f (Get-Date -Format 'yyyyMMdd'))
 $AiPromptVersion = 'v1'   # change when the prompts change, so cached answers are asked again
 $script:AiReady = $false; $script:AiDown = ''; $script:AiCalls = 0; $script:AiBadInRow = 0
-$script:AiClock = $null   # started at the first question, so MaxMinutesPerRun counts model time only
+$script:AiClock = $null
+$script:AiLimitLogged = $false
 $script:AiUsedKeys = @{}
 $script:AiCallsByKind = @{}
 
@@ -967,7 +968,29 @@ public static class NcItgText {
         $script:FastSim = $true
     } catch { Write-Log "Couldn't compile the fast name comparison, using the slower PowerShell one: $($_.Exception.Message)" 'WARN' }
 }
+# N-central names often carry notes, e.g. "DR-DT-24 (Brad Sharp) New". Compare the name as it is,
+# without the notes, and the leading asset tag, and keep the best score.
+$script:NameVariantCache = @{}
+function Get-NameVariants {
+    param([string]$S)
+    $k = [string]$S
+    if ($script:NameVariantCache.ContainsKey($k)) { return $script:NameVariantCache[$k] }
+    $v = New-Object System.Collections.ArrayList
+    $t = $k.Trim(); if ($t) { $null = $v.Add($t) }
+    $u = (($t -replace '\([^)]*\)', ' ') -replace '(?i)\b(new|old|spare|temp|loaner|replacement|retired)\b', ' ' -replace '\s+', ' ').Trim([char[]]' -_')
+    if ($u -and $v -notcontains $u) { $null = $v.Add($u) }
+    if ($t -match '^([A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+)') { $tag = $Matches[1]; if ($v -notcontains $tag) { $null = $v.Add($tag) } }
+    $arr = @($v)
+    $script:NameVariantCache[$k] = $arr
+    return $arr
+}
 function Get-NameSimilarity {
+    param([string]$First, [string]$Second)
+    $best = 0.0
+    foreach ($x in (Get-NameVariants $First)) { foreach ($y in (Get-NameVariants $Second)) { $v = Get-NameSimilarityCore $x $y; if ($v -gt $best) { $best = $v } } }
+    return $best
+}
+function Get-NameSimilarityCore {
     param([string]$First, [string]$Second)
     if ($script:FastSim) { return [NcItgText]::Similarity($First, $Second) }
     $x = ([string]$First).ToLowerInvariant() -replace '[^a-z0-9]', ''
@@ -1020,20 +1043,56 @@ function Test-LocalModel {
     Initialize-FastSimilarity
     Write-Log "Local AI model '$want' is available at $LmBase."
 }
+# POST to Ollama with hard timeouts (connect, wait for the answer, and reading it), so a call
+# can't hang the run. HttpWebRequest is used because Invoke-RestMethod's -TimeoutSec doesn't cover
+# every wait in Windows PowerShell 5.1. No proxy: Ollama is on this computer.
+function Invoke-OllamaPost {
+    param([string]$Path, [string]$Json, [int]$TimeoutSec)
+    $req = [Net.HttpWebRequest]::Create("$LmBase$Path")
+    $req.Method = 'POST'; $req.ContentType = 'application/json; charset=utf-8'
+    $req.Timeout = $TimeoutSec * 1000; $req.ReadWriteTimeout = $TimeoutSec * 1000
+    $req.AllowAutoRedirect = $false; $req.Proxy = $null
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Json); $req.ContentLength = $bytes.Length
+    $resp = $null
+    try {
+        $rs = $req.GetRequestStream(); try { $rs.Write($bytes, 0, $bytes.Length) } finally { $rs.Dispose() }
+        $resp = $req.GetResponse()
+    } catch {
+        $ex = Get-InnerException $_.Exception
+        if ($ex -is [Net.WebException] -and $ex.Status -eq [Net.WebExceptionStatus]::Timeout) { throw "no answer within $TimeoutSec seconds (LocalModel.TimeoutSec)" }
+        $body = ''
+        if ($ex -is [Net.WebException] -and $ex.Response) { try { $sr = New-Object IO.StreamReader($ex.Response.GetResponseStream()); $body = $sr.ReadToEnd(); $sr.Dispose() } catch { } }
+        throw "$($ex.Message) $body".Trim()
+    }
+    try { $sr = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8); $text = $sr.ReadToEnd(); $sr.Dispose() } finally { $resp.Dispose() }
+    return ($text | ConvertFrom-Json)
+}
+$script:AiNoThinkParam = $false   # set when this Ollama/model refuses the "think" setting
 function Invoke-LocalModel {
-    param([string]$System, [string]$Prompt, [hashtable]$Schema, [int]$NumCtx = 0)
+    param([string]$System, [string]$Prompt, [hashtable]$Schema, [int]$NumCtx = 0, [int]$NumPredict = 0)
     if ($NumCtx -lt 1) { $NumCtx = [int]$Lm.ContextTokens }
+    $opts = @{ temperature = 0; seed = 7; num_ctx = $NumCtx }
+    if ($NumPredict -gt 0) { $opts['num_predict'] = $NumPredict }   # caps the answer length, so a runaway answer can't take minutes
     $body = [ordered]@{
-        model = [string]$Lm.Model; stream = $false; format = $Schema
-        options = @{ temperature = 0; seed = 7; num_ctx = $NumCtx }
+        model = [string]$Lm.Model; stream = $false; format = $Schema; options = $opts
         messages = @(@{ role = 'system'; content = $System }, @{ role = 'user'; content = $Prompt })
     }
     if ($Lm.KeepAlive) { $body['keep_alive'] = [string]$Lm.KeepAlive }   # keeps the model loaded between questions
     $think = $Lm.Think
-    if ($think -is [string]) { if ($think -match '^(true|yes|1)$') { $think = $true } elseif ($think -match '^(false|no|0)$') { $think = $false } else { $think = $null } }
-    if ($think -is [bool]) { $body['think'] = $think }   # only sent when set: a "thinking" model is much slower
-    $json = ConvertTo-Json -InputObject $body -Depth 10 -Compress
-    $r = Invoke-RestMethod -Method POST -Uri "$LmBase/api/chat" -Body ([Text.Encoding]::UTF8.GetBytes($json)) -ContentType 'application/json; charset=utf-8' -TimeoutSec ([int]$Lm.TimeoutSec) -MaximumRedirection 0
+    if ($think -is [string]) { $think = ($think -match '^(true|yes|1)$') }
+    if ($null -eq $think) { $think = $false }   # empty/null (as in the v0.8/v0.9 example config) also means false
+    # Default false: a "thinking" model writes thousands of words first, which is slow and can push
+    # the JSON answer past the context window (v0.9: "the answer has no JSON object").
+    if ($think -is [bool] -and -not $script:AiNoThinkParam) { $body['think'] = $think }
+    try { $r = Invoke-OllamaPost -Path '/api/chat' -Json (ConvertTo-Json -InputObject $body -Depth 10 -Compress) -TimeoutSec ([int]$Lm.TimeoutSec) }
+    catch {
+        if ($body.Contains('think') -and ([string]$_.Exception.Message) -match 'think') {
+            # This model or Ollama version doesn't accept the setting: ask again without it.
+            $script:AiNoThinkParam = $true; $body.Remove('think')
+            Write-Log "Ollama refused the 'think' setting for this model, so it is not sent this run: $($_.Exception.Message)" 'WARN'
+            $r = Invoke-OllamaPost -Path '/api/chat' -Json (ConvertTo-Json -InputObject $body -Depth 10 -Compress) -TimeoutSec ([int]$Lm.TimeoutSec)
+        } else { throw }
+    }
     if (-not $r -or -not $r.message) { throw 'Ollama answered without a message.' }
     return $r
 }
@@ -1050,7 +1109,8 @@ function Get-OllamaTimingText {
 }
 function ConvertFrom-ModelJson {
     param([string]$Text)
-    $t = ([string]$Text).Trim()
+    $t = ([string]$Text).Trim() -replace '(?s)^```(?:json)?\s*', '' -replace '(?s)\s*```$', ''
+    if (-not $t) { throw 'the answer was empty' }
     $i = $t.IndexOf('{'); $j = $t.LastIndexOf('}')
     if ($i -lt 0 -or $j -le $i) { throw 'the answer has no JSON object' }
     return ($t.Substring($i, $j - $i + 1) | ConvertFrom-Json)
@@ -1067,7 +1127,7 @@ function ConvertTo-Confidence {
 # Returns @{ status = ok|deferred|error; answer; cached; why }. $Validate turns the parsed JSON into
 # a checked answer hashtable or throws (it gets the parsed JSON and $Context); only checked answers are cached.
 function Get-AiAnswer {
-    param([string]$Kind, [string]$Subject, [string]$System, [string]$Prompt, [hashtable]$Schema, [scriptblock]$Validate, $Context, [int]$MaxNewCalls = -1, [int]$NumCtx = 0)
+    param([string]$Kind, [string]$Subject, [string]$System, [string]$Prompt, [hashtable]$Schema, [scriptblock]$Validate, $Context, [int]$MaxNewCalls = -1, [int]$NumCtx = 0, [int]$NumPredict = 400)
     $key = Get-TextHash "$AiPromptVersion|$($Lm.Model)|$Kind|$System|$Prompt"
     $script:AiUsedKeys[$key] = $true
     $hit = $Sync.ai[$key]
@@ -1076,20 +1136,33 @@ function Get-AiAnswer {
         if ($t -and ([DateTime]::UtcNow - $t).TotalHours -lt [double]$Lm.CacheHours) { return @{ status = 'ok'; answer = $hit.answer; cached = $true; key = $key } }
     }
     if ($script:AiDown) { return @{ status = 'error'; why = $script:AiDown } }
-    if (-not $script:AiClock) { $script:AiClock = [Diagnostics.Stopwatch]::StartNew() }
     if ($MaxNewCalls -ge 0 -and [int]$script:AiCallsByKind[$Kind] -ge $MaxNewCalls) { return @{ status = 'deferred' } }
-    if ($script:AiCalls -ge [int]$Lm.MaxCallsPerRun -or $script:AiClock.Elapsed.TotalMinutes -ge [double]$Lm.MaxMinutesPerRun) { return @{ status = 'deferred' } }
+    # MaxMinutesPerRun counts time spent waiting for the model only (up to v0.9 it was wall-clock time
+    # since the first question, so slow work between questions used up the budget).
+    $usedMin = $script:Timing.AiMs / 60000.0
+    if ($script:AiCalls -ge [int]$Lm.MaxCallsPerRun -or $usedMin -ge [double]$Lm.MaxMinutesPerRun) {
+        if (-not $script:AiLimitLogged) {
+            $script:AiLimitLogged = $true
+            Write-Log ("Local AI limit reached after {0} questions and {1:N1} minutes of model time (MaxCallsPerRun {2}, MaxMinutesPerRun {3}). The remaining devices are held until the next run." -f $script:AiCalls, $usedMin, $Lm.MaxCallsPerRun, $Lm.MaxMinutesPerRun) 'WARN'
+        }
+        return @{ status = 'deferred' }
+    }
+    $attempt = 0
+    while ($true) {
+    $attempt++
     $script:AiCalls++
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $raw = ''; $answer = $null; $err = ''; $tm = ''
+    $raw = ''; $answer = $null; $err = ''; $tm = ''; $resp = $null
+    $askPrompt = $Prompt
+    if ($attempt -gt 1) { $askPrompt = $Prompt + "`n`nYour previous answer was not valid JSON. Answer ONLY with the JSON object, no other text." }
     try {
-        $resp = Invoke-LocalModel -System $System -Prompt $Prompt -Schema $Schema -NumCtx $NumCtx
+        $resp = Invoke-LocalModel -System $System -Prompt $askPrompt -Schema $Schema -NumCtx $NumCtx -NumPredict $NumPredict
         $raw = [string]$resp.message.content
         $tm = Get-OllamaTimingText $resp
         $thought = [string]$resp.message.thinking
         if ($thought -and -not $script:AiThinkWarned) {
             $script:AiThinkWarned = $true
-            Write-Log "The model writes $($thought.Length) characters of 'thinking' before each answer, which makes it much slower. To turn that off, set LocalModel.Think to false in the config." 'WARN'
+            Write-Log "The model writes $($thought.Length) characters of 'thinking' before each answer, which makes it much slower and can cut off the answer. LocalModel.Think is '$($Lm.Think)'; set it to false (the default)." 'WARN'
         }
     }
     catch {
@@ -1100,7 +1173,8 @@ function Get-AiAnswer {
         try { $answer = & $Validate (ConvertFrom-ModelJson $raw) $Context; $script:AiBadInRow = 0 }
         catch {
             $err = "Invalid answer: $($_.Exception.Message)"
-            $script:AiBadInRow++
+            if ($attempt -eq 1 -and [string]$resp.done_reason -eq 'length') { $err += ' (cut off: the answer hit the length limit)' }
+            if ($attempt -ge 2) { $script:AiBadInRow++ }
             if ($script:AiBadInRow -ge 3) { $script:AiDown = "The model '$($Lm.Model)' gave 3 invalid answers in a row (last: $($_.Exception.Message))." }
         }
     }
@@ -1108,7 +1182,10 @@ function Get-AiAnswer {
     $script:Timing.AiMs += $sw.ElapsedMilliseconds; $script:Timing.AiCalls++
     if ($Kind) { $script:AiCallsByKind[$Kind] = 1 + [int]$script:AiCallsByKind[$Kind] }
     Write-Log ("Local AI ({0}) {1}: {2:N1}s{3}{4}" -f $Kind, $Subject, ($sw.ElapsedMilliseconds / 1000.0), $(if ($tm) { " ($tm)" }), $(if ($err) { " - $err" }))
-    Write-AiAudit @{ type = 'call'; timing = $tm; kind = $Kind; subject = $Subject; model = [string]$Lm.Model; key = $key; system = $System; prompt = $Prompt; raw = $raw; answer = $answer; error = $err; ms = $sw.ElapsedMilliseconds }
+    Write-AiAudit @{ type = 'call'; attempt = $attempt; timing = $tm; kind = $Kind; subject = $Subject; model = [string]$Lm.Model; key = $key; system = $System; prompt = $askPrompt; raw = $raw; answer = $answer; error = $err; ms = $sw.ElapsedMilliseconds }
+    if ($err -and $attempt -lt 2 -and $err.StartsWith('Invalid answer') -and -not $script:AiDown) { continue }   # one retry
+    break
+    }
     if ($err) { return @{ status = 'error'; why = $err } }
     $Sync.ai[$key] = @{ askedUtc = Get-UtcText; kind = $Kind; answer = $answer }
     return @{ status = 'ok'; answer = $answer; cached = $false; key = $key }
@@ -1459,7 +1536,7 @@ function Invoke-DeviceSync {
             }
             if ($dupWhy.Count -gt 0) {
                 $stats.conflicts++
-                Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not created, it would be a duplicate: $((@($dupWhy | Select-Object -Unique)) -join '; '). Fix the serial/name, or merge or archive the existing one in IT Glue." (Get-Attr $c.Org 'resource-url')
+                Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not created, it would be a duplicate: $((@($dupWhy | Select-Object -Unique)) -join '; '). Fix the serial/name, or merge or archive the existing one in IT Glue (the separate IT Glue duplicate-configurations tool finds duplicates)." (Get-Attr $c.Org 'resource-url')
                 return
             }
             $attrs = @{ 'organization-id' = [int64]$c.OrgId; 'configuration-status-id' = [int64]$newStatusId }
@@ -1544,7 +1621,7 @@ function Invoke-DeviceSync {
             if ($inOrg.Count -eq 1) { $conf = $inOrg[0]; $how = 'serial' }
             elseif ($inOrg.Count -gt 1) {
                 $stats.conflicts++
-                Add-Failure 'DeviceConflict' "multi:$($c.Id)" $c.CustName $c.Name "$($inOrg.Count) IT Glue configurations in '$(Get-Attr $c.Org 'name')' have serial number $($c.Serial) (ids $((@($inOrg | ForEach-Object { $_.id })) -join ', ')). Archive the extra ones in IT Glue." (Get-Attr $inOrg[0] 'resource-url')
+                Add-Failure 'DeviceConflict' "multi:$($c.Id)" $c.CustName $c.Name "$($inOrg.Count) IT Glue configurations in '$(Get-Attr $c.Org 'name')' have serial number $($c.Serial) (ids $((@($inOrg | ForEach-Object { $_.id })) -join ', ')). These are duplicates already in IT Glue: merge or archive the extra ones (the separate IT Glue duplicate-configurations tool finds them)." (Get-Attr $inOrg[0] 'resource-url')
                 continue
             }
             # The same serial under another organization is ignored: only the device's own customer counts.
@@ -1561,7 +1638,7 @@ function Invoke-DeviceSync {
             if ($nm.Count -eq 1) { $conf = $nm[0]; $how = 'name' }
             elseif ($nm.Count -gt 1) {
                 $stats.conflicts++
-                Add-Failure 'DeviceConflict' "multiname:$($c.Id)" $c.CustName $c.Name "$($nm.Count) IT Glue configurations in '$(Get-Attr $c.Org 'name')' are named '$($c.Name)' (ids $((@($nm | ForEach-Object { $_.id })) -join ', ')). Archive the extra ones or give them serial numbers." (Get-Attr $c.Org 'resource-url')
+                Add-Failure 'DeviceConflict' "multiname:$($c.Id)" $c.CustName $c.Name "$($nm.Count) IT Glue configurations in '$(Get-Attr $c.Org 'name')' are named '$($c.Name)' (ids $((@($nm | ForEach-Object { $_.id })) -join ', ')). These are duplicates already in IT Glue: merge or archive the extra ones (the separate IT Glue duplicate-configurations tool finds them), or give them serial numbers." (Get-Attr $c.Org 'resource-url')
                 continue
             }
         }
@@ -1623,10 +1700,10 @@ function Invoke-DeviceSync {
     }
     # A device the model couldn't answer for: held if a limit was hit, else the usual way.
     $noAnswer = {
-        param($c, $r)
+        param($c, $r, [bool]$Quiet)
         if ($r.status -eq 'deferred') { $stats.aiDeferred++; $orgsHeld[$c.OrgId] = $true; return }   # not created this run, so no duplicate can slip in
         $stats.aiErrors++; $orgsHeld[$c.OrgId] = $true
-        Write-Log "Local AI couldn't check $($c.CustName) | $($c.Name), so it is matched without it: $($r.why)" 'WARN'
+        if (-not $Quiet) { Write-Log "Local AI couldn't check $($c.CustName) | $($c.Name), so it is matched without it: $($r.why)" 'WARN' }
         $null = & $planDevice $c $null ''
     }
 
@@ -1705,6 +1782,7 @@ function Invoke-DeviceSync {
         $byOrg = @{}
         foreach ($it in $aiItems) { if (-not $byOrg.ContainsKey($it.C.OrgId)) { $byOrg[$it.C.OrgId] = New-Object System.Collections.ArrayList }; $null = $byOrg[$it.C.OrgId].Add($it) }
         foreach ($oid in @($byOrg.Keys | Sort-Object)) {
+            $orgClock = [Diagnostics.Stopwatch]::StartNew(); $orgAiMs = $script:Timing.AiMs
             $items = @($byOrg[$oid] | Sort-Object @{ Expression = { Get-Attr $_.C.Loc 'name' } }, @{ Expression = { $_.C.Name } })
             $orgName = Get-Attr $items[0].C.Org 'name'
             $safe = (($orgName -replace '[^A-Za-z0-9 _-]', '') -replace '\s+', '_'); if ($safe.Length -gt 40) { $safe = $safe.Substring(0, 40) }
@@ -1715,6 +1793,7 @@ function Invoke-DeviceSync {
             $ci = 0
             while ($ci -lt $chunks.Count) {
                 $chunk = @($chunks[$ci]); $ci++
+                $prepClock = [Diagnostics.Stopwatch]::StartNew()
                 $sent = [ordered]@{}   # config id -> conf, union of each device's top candidates
                 $allowed = @{}         # device id -> @{ config id = $true }
                 $dRows = New-Object System.Collections.ArrayList
@@ -1740,6 +1819,7 @@ function Invoke-DeviceSync {
                     continue
                 }
                 $numCtx = [math]::Min($maxCtx, [math]::Max([int]$Lm.ContextTokens, $estTokens))
+                if ($prepClock.Elapsed.TotalSeconds -ge 5) { Write-Log ("Preparing the local AI question for {0} ({1} devices) took {2:N1}s." -f $orgName, $chunk.Count, $prepClock.Elapsed.TotalSeconds) 'WARN' }
                 $devRows += @($dRows); foreach ($cr in $cRows) { $confRows[$cr.config_id] = $cr }
                 $validate = {
                     param($o, $allowed)
@@ -1760,8 +1840,9 @@ function Invoke-DeviceSync {
                     if ($bad -gt [math]::Max(2, [int]($allowed.Count / 2))) { throw "$bad of the rows were invalid" }
                     return @{ rows = $rows; bad = $bad }
                 }
-                $r = Get-AiAnswer -Kind 'batch' -Subject "$orgName ($($chunk.Count) devices, $($cRows.Count) records)" -System $AiBatchSystem -Prompt $prompt -Schema $AiBatchSchema -Validate $validate -Context $allowed -NumCtx $numCtx
-                if ($r.status -ne 'ok') { foreach ($it in $chunk) { & $noAnswer $it.C $r; $null = $results.Add([pscustomobject][ordered]@{ device_id = $it.C.Id; device = $it.C.Name; config_id = ''; config = ''; confidence = ''; action = $r.status; reason = [string]$r.why }) }; continue }
+                $r = Get-AiAnswer -Kind 'batch' -Subject "$orgName ($($chunk.Count) devices, $($cRows.Count) records)" -System $AiBatchSystem -Prompt $prompt -Schema $AiBatchSchema -Validate $validate -Context $allowed -NumCtx $numCtx -NumPredict (150 * $chunk.Count + 300)
+                if ($r.status -eq 'error') { Write-Log "Local AI couldn't check $($chunk.Count) device(s) at $orgName, so they are matched the usual way: $($r.why)" 'WARN' }
+                if ($r.status -ne 'ok') { foreach ($it in $chunk) { & $noAnswer $it.C $r $true; $null = $results.Add([pscustomobject][ordered]@{ device_id = $it.C.Id; device = $it.C.Name; config_id = ''; config = ''; confidence = ''; action = $r.status; reason = [string]$r.why }) }; continue }
                 $rows = $r.answer.rows
                 # The same configuration picked for two devices in one answer: hold both for a person.
                 $picks = @{}
@@ -1788,6 +1869,8 @@ function Invoke-DeviceSync {
                 if ($confRows.Count) { @($confRows.Values) | Export-Csv -LiteralPath "$base-configs.csv" -NoTypeInformation -Encoding UTF8 }
                 if ($results.Count) { $results | Export-Csv -LiteralPath "$base-results.csv" -NoTypeInformation -Encoding UTF8 }
             } catch { Write-Log "Couldn't write the AI batch files for $orgName to $batchDir : $($_.Exception.Message)" 'WARN' }
+            $otherSec = $orgClock.Elapsed.TotalSeconds - ($script:Timing.AiMs - $orgAiMs) / 1000.0
+            if ($otherSec -ge 10) { Write-Log ("{0}: {1:N1}s spent outside the model for {2} device(s) (building lists, files)." -f $orgName, $otherSec, $items.Count) 'WARN' }
         }
         if ($aiItems.Count) { Write-Log "Local AI batch files (devices, configurations and results per customer): $batchDir" }
     }
