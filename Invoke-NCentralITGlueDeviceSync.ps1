@@ -26,6 +26,8 @@
       4. Matches the device to an existing IT Glue Configuration: the one it was linked to
          before (sync-state.json), else the same serial number in that organization, else the
          same name/hostname in that organization (only if the serial numbers don't disagree).
+         Every comparison stays inside the device's own IT Glue organization: the same serial or
+         name under another customer is ignored (not matched, not blocked, not reported).
          Anything ambiguous is reported (check 3) and left alone. Archived IT Glue
          Configurations are ignored completely: they are never matched, never count as a
          duplicate and are never changed. A device whose only IT Glue record is archived gets
@@ -132,7 +134,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.6'
+$ScriptVersion = '0.7'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -751,14 +753,14 @@ function Find-ITGlueDuplicateNow {
     $found = @()
     $names = @(@($Name, $Hostname) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)
     $queries = @()
-    if ($Serial) { $queries += "filter[serial_number]=$([Uri]::EscapeDataString($Serial))" }
+    if ($Serial) { $queries += "filter[organization_id]=$OrgId&filter[serial_number]=$([Uri]::EscapeDataString($Serial))" }
     foreach ($n in @(@($Name, $Hostname) | Where-Object { $_ } | Select-Object -Unique)) { $queries += "filter[organization_id]=$OrgId&filter[name]=$([Uri]::EscapeDataString($n))" }
     foreach ($q in $queries) {
         $r = Invoke-ITGlueGet -Uri "$BaseUrl/configurations?$q&filter[archived]=false&page[size]=50"
         foreach ($x in @($r.data | Where-Object { $_ })) {
             if ((Get-Attr $x 'archived') -eq 'True') { continue }
             # Compare exactly here, in case IT Glue's filter matches partly.
-            $sameSerial = $Serial -and (Get-SerialKey (Get-Attr $x 'serial-number')) -eq (Get-SerialKey $Serial)
+            $sameSerial = $Serial -and (Get-Attr $x 'organization-id') -eq $OrgId -and (Get-SerialKey (Get-Attr $x 'serial-number')) -eq (Get-SerialKey $Serial)
             $sameName = (Get-Attr $x 'organization-id') -eq $OrgId -and (($names -contains (Get-NameKey (Get-Attr $x 'name'))) -or ((Get-Attr $x 'hostname') -and $names -contains (Get-NameKey (Get-Attr $x 'hostname'))))
             if ($sameSerial -or $sameName) { $found += "'$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
         }
@@ -836,7 +838,7 @@ $script:AiUsedKeys = @{}
 
 $AiMatchSystem = @'
 You help keep IT documentation (IT Glue) in step with an RMM tool (N-central). N-central is the source of truth for devices.
-You get ONE device from N-central and a short list of existing IT Glue configurations at the SAME customer.
+You get ONE device from N-central and a short list of existing IT Glue configurations at the SAME customer and location.
 Decide whether one of those configurations is the SAME physical device, only named or recorded differently
 (for example: the computer was renamed, a different naming style, hostname vs. display name, a typo, an
 added or missing prefix or suffix, or the IT Glue record has no serial number).
@@ -852,7 +854,7 @@ Answer only with the JSON object.
 $AiArchiveSystem = @'
 You help clean up IT documentation (IT Glue). N-central, the RMM tool, monitors every active computer and server at this customer.
 You get ONE IT Glue configuration (a computer or server record) that is NOT linked to any device that is in N-central now,
-plus the N-central devices at the same customer with the most similar names.
+plus the N-central devices at the same customer and location with the most similar names.
 Decide whether this record is most likely a retired, replaced or duplicate device that a technician should archive.
 Signs it should be archived: not updated for a long time, status like inactive/retired/decommissioned, the name looks like an
 older version of an N-central device (same user or role with an older number or model), or it looks like a duplicate of one.
@@ -1097,13 +1099,14 @@ function Invoke-DeviceSync {
         if (-not $locsByOrg.ContainsKey($oid)) { $locsByOrg[$oid] = New-Object System.Collections.ArrayList }
         $null = $locsByOrg[$oid].Add($l)
     }
-    # Every non-archived configuration (linked to a device or not) by serial number (any organization)
-    # and by organization + name. Used to make sure nothing is created or renamed into a duplicate.
+    # Every non-archived configuration (linked to a device or not) by organization + serial number
+    # and by organization + name. Other organizations never count (a duplicate between two customers
+    # doesn't matter). Used to make sure nothing is created or renamed into a duplicate.
     $anyBySerial = @{}; $anyByOrgName = @{}
     foreach ($c in $confs) {
         $sk = Get-SerialKey (Get-Attr $c 'serial-number')
-        if ($sk -and -not $ignoreSerial.ContainsKey($sk)) { if (-not $anyBySerial.ContainsKey($sk)) { $anyBySerial[$sk] = New-Object System.Collections.ArrayList }; $null = $anyBySerial[$sk].Add($c) }
         $oid = Get-Attr $c 'organization-id'
+        if ($sk -and -not $ignoreSerial.ContainsKey($sk)) { $k = "$oid|$sk"; if (-not $anyBySerial.ContainsKey($k)) { $anyBySerial[$k] = New-Object System.Collections.ArrayList }; $null = $anyBySerial[$k].Add($c) }
         foreach ($n in @(@((Get-Attr $c 'name'), (Get-Attr $c 'hostname')) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)) {
             $k = "$oid|$n"
             if (-not $anyByOrgName.ContainsKey($k)) { $anyByOrgName[$k] = New-Object System.Collections.ArrayList }
@@ -1256,7 +1259,8 @@ function Invoke-DeviceSync {
         if ($sk.Length -lt 4 -or $ignoreSerial.ContainsKey($sk)) { $sk = '' }
         $c.Serial = ''; if ($sk) { $c.Serial = ([string]$a.serial).Trim() }
         $c.SerialKey = $sk
-        if ($sk) { if (-not $bySerial.ContainsKey($sk)) { $bySerial[$sk] = New-Object System.Collections.ArrayList }; $null = $bySerial[$sk].Add($c) }
+        # Same serial in two different customers doesn't matter; only within one organization.
+        if ($sk) { $k = "$($c.OrgId)|$sk"; if (-not $bySerial.ContainsKey($k)) { $bySerial[$k] = New-Object System.Collections.ArrayList }; $null = $bySerial[$k].Add($c) }
     }
     $dupLosers = @{}
     foreach ($sk in $bySerial.Keys) {
@@ -1314,10 +1318,10 @@ function Invoke-DeviceSync {
         $fieldFor = @{ 'name' = 'name'; 'hostname' = 'hostname'; 'serial-number' = 'serial-number'; 'configuration-type-id' = 'configuration-type'; 'location-id' = 'location'; 'operating-system-notes' = 'operating-system-notes'; 'mac-address' = 'mac-address'; 'primary-ip' = 'primary-ip'; 'manufacturer-id' = 'manufacturer'; 'model-id' = 'model' }
         if (-not $conf) {
             # Never create a duplicate: no non-archived configuration (linked to another device or not)
-            # may already have this serial number anywhere, or this name/hostname in this organization.
+            # in this organization may already have this serial number or this name/hostname.
             $dupWhy = @()
-            if ($c.SerialKey -and $anyBySerial.ContainsKey($c.SerialKey)) {
-                foreach ($x in $anyBySerial[$c.SerialKey]) { $dupWhy += "serial $($c.Serial) is on '$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
+            if ($c.SerialKey -and $anyBySerial.ContainsKey("$($c.OrgId)|$($c.SerialKey)")) {
+                foreach ($x in $anyBySerial["$($c.OrgId)|$($c.SerialKey)"]) { $dupWhy += "serial $($c.Serial) is on '$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
             }
             foreach ($n in @(@($c.Name, $want['hostname']) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)) {
                 if ($anyByOrgName.ContainsKey("$($c.OrgId)|$n")) {
@@ -1360,7 +1364,7 @@ function Invoke-DeviceSync {
         }
         if ($attrs.ContainsKey('serial-number')) {
             $others = @(); $sk = Get-SerialKey ([string]$attrs['serial-number'])
-            if ($anyBySerial.ContainsKey($sk)) { $others = @($anyBySerial[$sk] | Where-Object { [string]$_.id -ne [string]$conf.id }) }
+            if ($anyBySerial.ContainsKey("$($c.OrgId)|$sk")) { $others = @($anyBySerial["$($c.OrgId)|$sk"] | Where-Object { [string]$_.id -ne [string]$conf.id }) }
             if ($others.Count -gt 0) { $dupWhy += "serial $($attrs['serial-number']) is already on id $((@($others | ForEach-Object { $_.id })) -join ', ')"; $attrs.Remove('serial-number'); $changes = @($changes | Where-Object { -not $_.StartsWith('serial-number:') }) }
         }
         if ($dupWhy.Count -gt 0) {
@@ -1413,12 +1417,8 @@ function Invoke-DeviceSync {
                 $stats.conflicts++
                 Add-Failure 'DeviceConflict' "multi:$($c.Id)" $c.CustName $c.Name "$($inOrg.Count) IT Glue configurations in '$(Get-Attr $c.Org 'name')' have serial number $($c.Serial) (ids $((@($inOrg | ForEach-Object { $_.id })) -join ', ')). Archive the extra ones in IT Glue." (Get-Attr $inOrg[0] 'resource-url')
                 continue
-            } elseif ($all.Count -gt 0) {
-                $other = $all[0]
-                $stats.conflicts++
-                Add-Failure 'DeviceConflict' "othercust:$($c.Id)" $c.CustName $c.Name "Serial number $($c.Serial) is already on IT Glue configuration '$(Get-Attr $other 'name')' under a different organization ('$(Get-Attr $other 'organization-name')'). Not moved automatically: move or archive it in IT Glue, or move the device in N-central." (Get-Attr $other 'resource-url')
-                continue
             }
+            # The same serial under another organization is ignored: only the device's own customer counts.
         }
         # c) Same name/hostname in the same organization, when the serial numbers don't disagree.
         if (-not $conf -and $Cfg.Sync.MatchByName) {
@@ -1477,6 +1477,8 @@ function Invoke-DeviceSync {
             if ($linkedConf.ContainsKey($xid) -and $linkedConf[$xid] -ne $c.Id -and $liveIds.ContainsKey([string]$linkedConf[$xid])) { continue }
             $xs = Get-SerialKey (Get-Attr $x 'serial-number'); if ($ignoreSerial.ContainsKey($xs)) { $xs = '' }
             if ($c.SerialKey -and $xs -and $xs -ne $c.SerialKey) { continue }   # different serial = different device
+            $xl = Get-Attr $x 'location-id'
+            if ($xl -and $xl -ne $c.LocId) { continue }   # same customer AND same location only (no location = still a candidate)
             $sim = 0.0
             foreach ($dn in @(@($c.Name, $c.Hostname) | Where-Object { $_ })) {
                 foreach ($cn in @(@((Get-Attr $x 'name'), (Get-Attr $x 'hostname')) | Where-Object { $_ })) { $sv = Get-NameSimilarity $dn $cn; if ($sv -gt $sim) { $sim = $sv } }
@@ -1496,7 +1498,7 @@ function Invoke-DeviceSync {
             $v = Get-ShortText $p[1] 80; if ($v) { $dev[$p[0]] = $v }
         }
         $cl = @($top | ForEach-Object { Get-ConfFacts $_.Conf })
-        $prompt = "N-central device:`n$(ConvertTo-Json -InputObject $dev -Depth 3 -Compress)`n`nIT Glue configurations at the same customer ($(Get-Attr $c.Org 'name')), archived ones left out:`n$(ConvertTo-Json -InputObject $cl -Depth 3 -Compress)"
+        $prompt = "N-central device:`n$(ConvertTo-Json -InputObject $dev -Depth 3 -Compress)`n`nIT Glue configurations at the same customer ($(Get-Attr $c.Org 'name')) and location ($(Get-Attr $c.Loc 'name')) or with no location, archived ones left out:`n$(ConvertTo-Json -InputObject $cl -Depth 3 -Compress)"
         $ids = @($top | ForEach-Object { [string]$_.Conf.id })
         $validate = {
             param($o, $ids)
@@ -1563,7 +1565,10 @@ function Invoke-DeviceSync {
                 if ($claimed.ContainsKey($xid) -or $linkedConf.ContainsKey($xid) -or $aiSuggested.ContainsKey($xid) -or $Lm.KeepConfigurationIds -contains $xid) { continue }
                 $xh = Get-Attr $x 'hostname'
                 if ($ncNames.ContainsKey((Get-NameKey (Get-Attr $x 'name'))) -or ($xh -and $ncNames.ContainsKey((Get-NameKey $xh)))) { continue }
-                $near = @($ncByOrg[$oid] | ForEach-Object {
+                $xl = Get-Attr $x 'location-id'
+                $sameSite = @($ncByOrg[$oid] | Where-Object { -not $xl -or $_.LocId -eq $xl })
+                if ($sameSite.Count -eq 0) { continue }   # no N-central devices at that location to compare with
+                $near = @($sameSite | ForEach-Object {
                         $c = $_; $sim = 0.0
                         foreach ($dn in @(@($c.Name, $c.Hostname) | Where-Object { $_ })) { foreach ($cn in @(@((Get-Attr $x 'name'), $xh) | Where-Object { $_ })) { $sv = Get-NameSimilarity $dn $cn; if ($sv -gt $sim) { $sim = $sv } } }
                         @{ Sim = $sim; C = $c }
@@ -1572,7 +1577,7 @@ function Invoke-DeviceSync {
                         if ($_.C.Serial) { $f['serial'] = $_.C.Serial }
                         $f
                     })
-                $prompt = "Current month: $month`nCustomer: $(Get-Attr $x 'organization-name') ($($ncByOrg[$oid].Count) computers/servers in N-central)`n`nIT Glue configuration not linked to any N-central device:`n$(ConvertTo-Json -InputObject (Get-ConfFacts $x) -Depth 3 -Compress)`n`nN-central devices at this customer with the most similar names:`n$(ConvertTo-Json -InputObject $near -Depth 3 -Compress)"
+                $prompt = "Current month: $month`nCustomer: $(Get-Attr $x 'organization-name') $(if ($xl) { "location $(Get-Attr $x 'location-name'), " })($($sameSite.Count) computers/servers there in N-central)`n`nIT Glue configuration not linked to any N-central device:`n$(ConvertTo-Json -InputObject (Get-ConfFacts $x) -Depth 3 -Compress)`n`nN-central devices at this customer with the most similar names:`n$(ConvertTo-Json -InputObject $near -Depth 3 -Compress)"
                 $validate = {
                     param($o, $unused)
                     if (-not $o.PSObject.Properties['archive'] -or -not $o.PSObject.Properties['confidence']) { throw 'archive or confidence is missing' }

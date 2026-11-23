@@ -12,7 +12,7 @@ sites and contacts, so this script **never creates, renames or changes an IT Glu
 or location**. It only creates and updates IT Glue Configurations, and it never deletes or
 archives anything.
 
-> **Status: v0.6, not yet tested against live N-central or IT Glue.** The N-central field names
+> **Status: v0.7, not yet tested against live N-central or IT Glue.** The N-central field names
 > (especially the hardware details from `/api/devices/{id}/assets`) are based on N-able's API
 > documentation and need checking on the first dry run. Follow "First run" below. The optional
 > local AI model mode (v0.4) has not been run against Ollama yet either.
@@ -46,7 +46,7 @@ internal one), use `NCentral.ExcludeCustomerIds` or `ExcludeCustomerNames`.
 |---|-------|-------|
 | 1 | Customer | N-central customer has no IT Glue organization with that name (or more than one), or the device is at service-organization level. |
 | 2 | Site | N-central site has no IT Glue location with that name in the matched organization, or the device has no site and the organization doesn't have exactly one location. |
-| 3 | Can't match safely | Creating or renaming would make a duplicate (see "No duplicates"); two N-central devices with the same serial or name (the older one is skipped and the newest check-in wins); several IT Glue configurations with the same serial or name; the serial is on a configuration under a **different** organization; the device moved customer in N-central; or IT Glue keeps ignoring an update after `MaxRetries` (3). Nothing is changed for these. |
+| 3 | Can't match safely | Creating or renaming would make a duplicate (see "No duplicates"); two N-central devices with the same serial or name in the same customer (the older one is skipped and the newest check-in wins); several IT Glue configurations in the same organization with the same serial or name; the device moved customer in N-central; or IT Glue keeps ignoring an update after `MaxRetries` (3). Nothing is changed for these. |
 | 4 | IT Glue refused | A create or update was refused (with IT Glue's error). Retried next run. |
 | 5 | Gone from N-central | A device synced before is no longer in N-central. Report only by default; `RetiredDeviceAction: "SetStatus"` sets its status to `RetiredStatus` instead. |
 | 6 | Local AI: check this match | Only with the local AI model on. The model thinks a new N-central device may be an existing IT Glue configuration with a different name, but isn't sure enough to link it. The device is held (not created). Also: the model isn't available this run, or an `ApprovedMatches` entry is wrong. |
@@ -91,7 +91,8 @@ the same computer (default `http://localhost:11434`) with the model pulled (defa
 
 **The script decides, the model only suggests.** Exact matching (link, serial, name) always runs
 first. Only the devices still unmatched go to the model, **one device at a time**, with up to
-`MaxCandidates` (15) **non-archived** IT Glue configurations from the **same organization**. The
+`MaxCandidates` (15) **non-archived** IT Glue configurations from the **same organization and
+location** (configurations with no location are included too). The
 candidates are pre-filtered by the script: not already linked to another device that is in
 N-central, not matched to another device this run, no serial number that disagrees, and ranked by
 how alike the names are (and a matching MAC address). If no candidate's name is at least
@@ -130,11 +131,16 @@ model is slower but usually better at this. Change `Model` and nothing else.
 
 ## No duplicates
 
+**Only within one customer.** Every comparison (matching, duplicate checks, the live re-check, the
+local AI model) stays inside the device's own IT Glue organization. The same serial number or name
+under a different customer is ignored completely: it isn't matched, doesn't block anything and
+isn't reported. (Up to v0.6, a serial number found under another customer blocked the device and
+was reported.)
+
 The script never creates a duplicate Configuration, and never renames one into a duplicate.
 Before **creating** a device it checks every **non-archived** IT Glue configuration:
 
-- **Serial number:** no non-archived configuration anywhere in IT Glue (any organization) may
-  already have it.
+- **Serial number:** no non-archived configuration in that organization may already have it.
 - **Name / hostname:** no non-archived configuration in that organization may already have it.
 - Right before the create call, it asks IT Glue again (by serial number and by name, non-archived
   only), in case someone added the device since the run started.

@@ -4,7 +4,7 @@ Step-by-step guide to installing and configuring the N-central to IT Glue device
 sync computer. You don't need to know anything about the script beforehand. Do the parts in order
 and don't skip the tests.
 
-> **Status:** version 0.6. The script has **not been fully tested against live N-central and
+> **Status:** version 0.7. The script has **not been fully tested against live N-central and
 > IT Glue yet.** That is why setup goes through a dry run, then a one-device test, then a
 > report-only task, before it is allowed to change anything.
 
@@ -19,8 +19,9 @@ and don't skip the tests.
 - A device is only synced when its **N-central customer name matches an IT Glue organization
   name**, and its **N-central site name matches one of that organization's locations**. Devices
   that don't match are skipped and reported by email.
-- It never creates a duplicate (same serial number anywhere in IT Glue, or same name in the
-  same organization). Archived IT Glue configurations don't count: if a device is in N-central
+- It never creates a duplicate within a customer (same serial number or same name in the
+  same organization; the same serial or name under a different customer is ignored). Archived
+  IT Glue configurations don't count: if a device is in N-central
   and its only IT Glue record is archived, a new one is created. Archived records are never
   changed.
 - **It changes nothing unless you add `-Apply`.** Without it, it only reports.
