@@ -49,6 +49,29 @@
     "DelayMsBetweenWrites": 250
   },
 
+  "LocalModel": {
+    "_comment": "Optional local AI model in Ollama (off unless Enabled is true or the script is run with -UseLocalModel). It only suggests matches for devices the serial number and name checks couldn't match, and IT Glue configurations that look retired. AutoLink true + confidence >= AutoLinkConfidence = linked; >= ReviewConfidence = held and reported for a person; lower = treated as no match. Endpoint must be on this computer unless AllowRemoteEndpoint is true. ApprovedMatches / RejectedMatches: {\"N-central device id\": \"IT Glue configuration id\"}, copied from the alert. KeepConfigurationIds: IT Glue ids never to suggest archiving.",
+    "Enabled": false,
+    "Endpoint": "http://localhost:11434",
+    "Model": "gemma4:12b",
+    "AllowRemoteEndpoint": false,
+    "AutoLink": true,
+    "AutoLinkConfidence": 90,
+    "ReviewConfidence": 60,
+    "MinNameSimilarity": 0.3,
+    "MaxCandidates": 15,
+    "SuggestArchive": true,
+    "TimeoutSec": 180,
+    "MaxCallsPerRun": 100,
+    "MaxMinutesPerRun": 20,
+    "CacheHours": 336,
+    "ContextTokens": 8192,
+    "KeepAlive": "15m",
+    "ApprovedMatches": {},
+    "RejectedMatches": {},
+    "KeepConfigurationIds": []
+  },
+
   "ReminderHours": 24,
   "NotifyOnResolved": true,
   "MaxItemsPerCheck": 50,

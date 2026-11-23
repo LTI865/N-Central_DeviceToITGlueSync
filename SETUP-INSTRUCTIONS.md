@@ -4,7 +4,7 @@ Step-by-step guide to installing and configuring the N-central to IT Glue device
 sync computer. You don't need to know anything about the script beforehand. Do the parts in order
 and don't skip the tests.
 
-> **Status:** version 0.2. The script has **not been fully tested against live N-central and
+> **Status:** version 0.4. The script has **not been fully tested against live N-central and
 > IT Glue yet.** That is why setup goes through a dry run, then a one-device test, then a
 > report-only task, before it is allowed to change anything.
 
@@ -403,7 +403,77 @@ task; there's still only one task.
 
 To go back to report-only at any time, run the same command **without** `-Apply`.
 
-Setup is done.
+Setup is done. Part 10.3 is optional.
+
+### 10.3 Optional: turn on the local AI model (Ollama)
+
+This lets a model running in Ollama on this PC look at devices that the serial-number and name
+checks couldn't match (for example `JSMITH-LT` in N-central and `John Smith Laptop` in IT Glue),
+and suggest IT Glue records that look retired. The script still makes every decision; the model
+never creates, archives or deletes anything. How it works and what each answer does: README,
+"Optional: local AI model". **This mode hasn't been tested against Ollama yet**, so go through
+the steps in order.
+
+**1. Make sure Ollama runs even when nobody is logged in.** The scheduled task runs as
+`svc-itgmonitor`, often with nobody signed in. The Ollama desktop app only runs while the person
+who installed it is logged in, so the task would find it down (the sync then carries on without
+the model and the alert says so). Either keep that user logged in, or run `ollama serve` from its
+own scheduled task "At startup" (as the account that pulled the models, "Run whether user is
+logged on or not"). Ollama listens on `127.0.0.1:11434` by default, which every account on this
+PC can reach; nothing has to be opened in the firewall. Don't set `OLLAMA_HOST=0.0.0.0`.
+
+**2. Pull and check the model** (in a normal window as the account that runs Ollama):
+```powershell
+ollama pull gemma4:12b
+ollama list
+ollama run gemma4:12b "Say OK"
+```
+`ollama list` must show the exact name you'll put in the config. To try the larger one later:
+`ollama pull gemma4:31b` (slower, usually better at this).
+
+**3. Check that the service account can reach Ollama.** In a **service-account window**
+(Part 5, steps 1 to 3):
+```powershell
+whoami
+(Invoke-RestMethod http://localhost:11434/api/tags).models.name
+```
+It must print `lti-dt-ai\svc-itgmonitor` and list `gemma4:12b`. If it can't connect, Ollama
+isn't running (step 1).
+
+**4. Dry run with the model**, still in the service-account window:
+```powershell
+cd 'C:\LTI\NCentralITGlueDeviceSync'
+.\Invoke-NCentralITGlueDeviceSync.ps1 -DryRun -UseLocalModel
+```
+Look for `Local AI model 'gemma4:12b' is available` near the top and a `Local AI: N asked ...`
+summary near the end. The first question can take a minute while the model loads. Then read:
+- `C:\ProgramData\NCentralITGlueDeviceSync\sync-preview.json` > `localModel.decisions`: one
+  line per device or record, with the action (`link`, `review`, `none`, `suggest-archive`,
+  `keep`), confidence and reason.
+- `logs\ai-YYYYMMDD.jsonl`: the exact question and raw answer for each.
+
+If a `link` decision is wrong, the model is too confident for automatic links: set
+`"AutoLink": false` (everything is held for you to check) or raise `AutoLinkConfidence`. If it
+keeps timing out, raise `TimeoutSec` or use the smaller model.
+
+**5. Turn it on for the task.** In the **admin window**, edit the config and set:
+```json
+"LocalModel": { "Enabled": true, "Model": "gemma4:12b" }
+```
+(add only the settings you change; the rest use the defaults in the example config). The task
+doesn't need to be registered again; the next run uses it.
+
+**6. Handling the alerts.**
+- *Check 6, possible match:* the device is **not created** until you decide. Open both records.
+  Same device: add the line from the alert to `"ApprovedMatches"`, for example
+  `"ApprovedMatches": { "123456789": "4567890" }`. Different device: add the same line to
+  `"RejectedMatches"` instead. The next run links it or creates it.
+- *Check 7, consider archiving:* archive it in IT Glue yourself if it's retired, or add its id to
+  `"KeepConfigurationIds": [ "4567890" ]` to stop the suggestion.
+- *Check 6, "Local AI model not available":* Ollama was down or the model is missing; devices
+  were matched the normal way that run.
+
+To turn the model off again, set `"Enabled": false`.
 
 ---
 
@@ -484,7 +554,7 @@ Shown at the end of every run (`Finished with exit code N`) and as `LastTaskResu
 | Code | Means | What to do |
 |---|---|---|
 | 0 | Everything matched (and with `-Apply`, every change was made) | Nothing |
-| 1 | Some devices were skipped because of a problem (name mismatch, conflict). Alert sent | Read the alert or log, fix the names or conflicts |
+| 1 | Some devices were skipped because of a problem (name mismatch, conflict, or a local AI suggestion waiting for you). Alert sent | Read the alert or log, fix the names or conflicts, or answer the AI suggestion (Part 10.3, step 6) |
 | 2 | The sync couldn't run (config, token, key, N-central or IT Glue unreachable) | Read the red error in the log; see the table below |
 | 3 | An alert email couldn't be sent (it's retried next run) | Run `-TestNotification` and fix SMTP |
 | 4 | IT Glue refused a change, or too many devices disappeared from N-central at once | Read check 4 or 5 in the log |
@@ -508,6 +578,10 @@ Shown at the end of every run (`Finished with exit code N`) and as `LastTaskResu
 | `runas` says `Logon failure` | Wrong password, or the account is disabled | Check the account in Computer Management > Local Users and Groups |
 | Task never runs, `LastTaskResult` 2147943785 | The service account lacks **Log on as a batch job** | Add it in `secpol.msc` > Local Policies > User Rights Assignment |
 | Task fails after the service account's password was changed | The task stores the password | Re-register the task (Part 9 or 10.2) with the new password |
+| `Ollama isn't answering at http://localhost:11434` | Ollama isn't running for the task (nobody logged in), or the app was closed | Part 10.3, step 1 |
+| `Ollama ... doesn't have the model 'X'` | The model name in the config doesn't match `ollama list` | `ollama pull X`, or copy the exact name from `ollama list` |
+| `LocalModel.Endpoint ... is not on this computer` | Endpoint points at another machine | Use `http://localhost:11434`, or set `AllowRemoteEndpoint` if that's really intended |
+| `Ollama stopped answering during the run (... timed out)` | The model is slow or still loading | Raise `LocalModel.TimeoutSec`, or use the smaller model |
 | Devices listed under `creates` that already exist in IT Glue | Serial or name differs between the two systems | Don't apply. Fix the record by hand or report it |
 | `waiting for hardware details` doesn't go down | Only 300 devices are read per run | Let the report-only task run a few times, or raise `NCentral.MaxAssetLookupsPerRun` for one run |
 
@@ -521,7 +595,8 @@ All in `C:\ProgramData\NCentralITGlueDeviceSync`:
 | `sync-preview.json` | The last plan: `creates`, `updates`, `retire` |
 | `current-failures.csv` | The current problems (also attached to alert emails) |
 | `ncentral-asset-sample.json` | One raw hardware reply from N-central, to check field names |
-| `sync-state.json` | Which N-central device is linked to which IT Glue configuration |
+| `sync-state.json` | Which N-central device is linked to which IT Glue configuration (and cached local AI answers) |
+| `logs\ai-YYYYMMDD.jsonl` | Local AI model only: every question, raw answer and decision (kept 30 days) |
 | `state.json` | Alert history (so the same alert isn't sent every run) |
 | `secrets.json` | Encrypted secrets. Not readable by people; only the saving account can decrypt them |
 
@@ -532,4 +607,6 @@ All in `C:\ProgramData\NCentralITGlueDeviceSync`:
 | Copy files, `icacls`, edit config | Admin |
 | `-SetSecret ... -SecretScope CurrentUser` | **Service account (runas)** |
 | `-TestNotification`, `-DryRun`, `-Apply -DeviceId`, `-Apply -ChangeLimit` | **Service account (runas)** |
+| `-DryRun -UseLocalModel`, checking Ollama with `Invoke-RestMethod` | **Service account (runas)** |
+| `ollama pull`, `ollama list` | The account that runs Ollama |
 | Register task, `-Unregister`, delete `secrets.json` | Admin |

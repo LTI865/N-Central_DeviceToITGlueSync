@@ -35,6 +35,19 @@
       6. With -Apply only: makes at most Sync.MaxChangesPerRun changes (the rest go on the
          next runs). Without -Apply nothing in IT Glue is changed.
 
+    Optional local AI model (-UseLocalModel or LocalModel.Enabled, off by default): a model
+    running in Ollama on this computer is asked about the devices that step 4 couldn't match by
+    serial number or name. It gets one device at a time plus a short list of non-archived IT
+    Glue configurations at the same customer, and answers in strict JSON (match id or none,
+    confidence, reason). The script checks the answer: the id must be one of the candidates.
+    High confidence (LocalModel.AutoLinkConfidence) links the device to that configuration;
+    medium confidence (LocalModel.ReviewConfidence) holds the device and reports the possible
+    match for a person (check 6); anything else is treated as no match. It can also suggest IT
+    Glue configurations that look retired (check 7). Suggestions only: the model never
+    creates, archives or deletes anything. Every prompt and answer is written to
+    logs\ai-YYYYMMDD.jsonl. If Ollama is unreachable or keeps giving bad answers, the run
+    carries on without it (as before) and the report says so.
+
     Never deletes or archives anything in IT Glue. Devices that were synced before but are no
     longer in N-central are reported (check 5); with Sync.RetiredDeviceAction "SetStatus" their
     Configuration status is set to Sync.RetiredStatus (at most Sync.MaxRetiresPerRun per run;
@@ -82,6 +95,10 @@
     Fetch hardware details again for every device (still capped by
     NCentral.MaxAssetLookupsPerRun), ignoring the cache.
 
+.PARAMETER UseLocalModel
+    Use the local AI model (Ollama) for this run, as if LocalModel.Enabled were true. See the
+    LocalModel settings in the config.
+
 .PARAMETER TestNotification
     Sends a test message through every configured notification method and stops.
 
@@ -96,6 +113,9 @@
 
 .EXAMPLE
     .\Invoke-NCentralITGlueDeviceSync.ps1 -Apply -ChangeLimit 600
+
+.EXAMPLE
+    .\Invoke-NCentralITGlueDeviceSync.ps1 -DryRun -UseLocalModel
 #>
 [CmdletBinding(SupportsShouldProcess = $true, PositionalBinding = $false)]
 param(
@@ -106,12 +126,13 @@ param(
     [int]$ChangeLimit = -1,
     [int]$RetireLimit = -1,
     [switch]$RefreshAssets,
+    [switch]$UseLocalModel,
     [switch]$TestNotification,
     [switch]$ForceNotify
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.3'
+$ScriptVersion = '0.4'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -127,6 +148,8 @@ $CheckNames = [ordered]@{
     'DeviceConflict'      = "3. Devices that can't be matched safely"
     'WriteFailed'         = '4. Changes IT Glue refused'
     'RemovedFromNCentral' = '5. Synced devices no longer in N-central'
+    'AiReview'            = '6. Possible matches from the local AI model (a person must check them)'
+    'AiArchive'           = '7. IT Glue configurations the local AI model suggests archiving'
 }
 
 # =====================================================================================
@@ -179,6 +202,13 @@ $Defaults = [ordered]@{
         MaxRetries = 3
         DelayMsBetweenWrites = 250
     }
+    LocalModel             = @{
+        Enabled = $false; Endpoint = 'http://localhost:11434'; Model = 'gemma4:12b'; AllowRemoteEndpoint = $false
+        AutoLink = $true; AutoLinkConfidence = 90; ReviewConfidence = 60; MinNameSimilarity = 0.3; MaxCandidates = 15
+        SuggestArchive = $true; TimeoutSec = 180; MaxCallsPerRun = 100; MaxMinutesPerRun = 20; CacheHours = 336
+        ContextTokens = 8192; KeepAlive = '15m'
+        ApprovedMatches = @{}; RejectedMatches = @{}; KeepConfigurationIds = @()
+    }
     ReminderHours          = 24
     NotifyOnResolved       = $true
     MaxItemsPerCheck       = 50
@@ -219,6 +249,9 @@ foreach ($k in 'ExcludeCustomerIds', 'ExcludeCustomerNames', 'ExcludeSiteIds', '
 $Cfg.Sync.UpdateFields = @($Cfg.Sync.UpdateFields | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() })
 $Cfg.Smtp.To = @($Cfg.Smtp.To | Where-Object { $_ })
 if ($Cfg.CustomerNameMap -isnot [hashtable]) { $Cfg.CustomerNameMap = @{} }
+foreach ($k in 'ApprovedMatches', 'RejectedMatches') { if ($Cfg.LocalModel[$k] -isnot [hashtable]) { $Cfg.LocalModel[$k] = @{} } }
+$Cfg.LocalModel.KeepConfigurationIds = @($Cfg.LocalModel.KeepConfigurationIds | Where-Object { $null -ne $_ -and [string]$_ -ne '' } | ForEach-Object { ([string]$_).Trim() })
+$UseAI = ([bool]$UseLocalModel) -or ($Cfg.LocalModel.Enabled -eq $true)
 
 $DataFolder = [string]$Cfg.DataFolder
 $LogFolder = Join-Path $DataFolder 'logs'
@@ -248,7 +281,7 @@ function Write-Log {
 foreach ($k in $unknownKeys) { Write-Log "Unknown setting '$k' in the config file was ignored (check the spelling)." 'WARN' }
 try {
     $cutoff = (Get-Date).AddDays(-[int]$Cfg.LogRetentionDays)
-    Get-ChildItem -LiteralPath $LogFolder -Filter 'sync-*.log' -File | Where-Object { $_.LastWriteTime -lt $cutoff } | Remove-Item -Force
+    Get-ChildItem -LiteralPath $LogFolder -File | Where-Object { ($_.Name -like 'sync-*.log' -or $_.Name -like 'ai-*.jsonl') -and $_.LastWriteTime -lt $cutoff } | Remove-Item -Force
 } catch { Write-Log "Couldn't clean up old logs: $($_.Exception.Message)" 'WARN' }
 
 # =====================================================================================
@@ -381,12 +414,13 @@ function Read-State {
 }
 # links:  N-central device id -> @{ itg = IT Glue configuration id; org; linkedUtc; diffHash; sends; retiredUtc }
 # assets: N-central device id -> @{ fetchedUtc; serial; manufacturer; model; os; mac; ip }
+# ai:     hash of a local-model question -> @{ askedUtc; kind; answer } (answers reused until CacheHours)
 function Read-SyncState {
-    $st = @{ links = @{}; assets = @{} }
+    $st = @{ links = @{}; assets = @{}; ai = @{} }
     if (Test-Path -LiteralPath $SyncStatePath) {
         try {
             $j = ConvertTo-Hashtable (Get-Content -LiteralPath $SyncStatePath -Raw | ConvertFrom-Json)
-            foreach ($k in 'links', 'assets') { if ($j[$k] -is [hashtable]) { $st[$k] = $j[$k] } }
+            foreach ($k in 'links', 'assets', 'ai') { if ($j[$k] -is [hashtable]) { $st[$k] = $j[$k] } }
         } catch {
             # Without the links, devices are matched again by serial number and name, so this is safe.
             Write-Log "Sync state $SyncStatePath couldn't be read; devices will be matched again by serial number and name: $($_.Exception.Message)" 'WARN'
@@ -407,6 +441,7 @@ if ($Apply) { $mode = 'APPLY (creates and updates IT Glue configurations)' }
 if ($DryRun) { $mode = 'DRY RUN (nothing changed, nothing sent, state not saved)' }
 Write-Log "N-CENTRAL > IT GLUE DEVICE SYNC v$ScriptVersion - $mode"
 if ($Limited) { Write-Log "Limited to N-central device id(s): $($DeviceId -join ', ')" }
+if ($UseAI) { Write-Log "Local AI model: $($Cfg.LocalModel.Model) at $($Cfg.LocalModel.Endpoint) (suggestions only; auto-link at confidence $($Cfg.LocalModel.AutoLinkConfidence)+$(if ($Cfg.LocalModel.AutoLink -ne $true) { ' is OFF' }))." }
 
 # =====================================================================================
 # Shared HTTP helpers
@@ -756,10 +791,193 @@ function Get-SectionText {
 }
 
 # =====================================================================================
+# Optional local AI model (Ollama on this computer). It only SUGGESTS. The script checks every
+# answer and makes every decision; the model never creates, archives or deletes anything.
+# =====================================================================================
+$Lm = $Cfg.LocalModel
+$LmBase = ([string]$Lm.Endpoint).Trim().TrimEnd('/')
+$AiLogPath = Join-Path $LogFolder ("ai-{0}.jsonl" -f (Get-Date -Format 'yyyyMMdd'))
+$AiPromptVersion = 'v1'   # change when the prompts change, so cached answers are asked again
+$script:AiReady = $false; $script:AiDown = ''; $script:AiCalls = 0; $script:AiBadInRow = 0
+$script:AiClock = $null   # started at the first question, so MaxMinutesPerRun counts model time only
+$script:AiUsedKeys = @{}
+
+$AiMatchSystem = @'
+You help keep IT documentation (IT Glue) in step with an RMM tool (N-central). N-central is the source of truth for devices.
+You get ONE device from N-central and a short list of existing IT Glue configurations at the SAME customer.
+Decide whether one of those configurations is the SAME physical device, only named or recorded differently
+(for example: the computer was renamed, a different naming style, hostname vs. display name, a typo, an
+added or missing prefix or suffix, or the IT Glue record has no serial number).
+Rules:
+- Only choose a configuration from the list, by its id. If none is clearly the same device, set match_id to "".
+- A different serial number means a different device. A matching serial number or MAC address is strong evidence.
+- Names that are only alike in a pattern (PC-01 vs PC-02, or two users' laptops) are NOT the same device.
+- Matching manufacturer, model, type and location support a match; a conflict weakens it.
+- confidence is 0 to 100: how sure you are that match_id is the same device. Use 0 when match_id is "".
+- reason is one short sentence a technician can check.
+Answer only with the JSON object.
+'@
+$AiArchiveSystem = @'
+You help clean up IT documentation (IT Glue). N-central, the RMM tool, monitors every active computer and server at this customer.
+You get ONE IT Glue configuration (a computer or server record) that is NOT linked to any device that is in N-central now,
+plus the N-central devices at the same customer with the most similar names.
+Decide whether this record is most likely a retired, replaced or duplicate device that a technician should archive.
+Signs it should be archived: not updated for a long time, status like inactive/retired/decommissioned, the name looks like an
+older version of an N-central device (same user or role with an older number or model), or it looks like a duplicate of one.
+Signs to keep it: updated recently, a kind of device N-central may not monitor, or no clear replacement and recent activity.
+Nothing is archived automatically: a person reviews your answer.
+confidence is 0 to 100: how sure you are about your archive answer. reason is one short sentence a technician can check.
+Answer only with the JSON object.
+'@
+$AiMatchSchema = @{
+    type = 'object'
+    properties = [ordered]@{ match_id = @{ type = 'string' }; confidence = @{ type = 'integer'; minimum = 0; maximum = 100 }; reason = @{ type = 'string' } }
+    required = @('match_id', 'confidence', 'reason')
+}
+$AiArchiveSchema = @{
+    type = 'object'
+    properties = [ordered]@{ archive = @{ type = 'boolean' }; confidence = @{ type = 'integer'; minimum = 0; maximum = 100 }; reason = @{ type = 'string' } }
+    required = @('archive', 'confidence', 'reason')
+}
+
+# 0..1, how alike two device names are (letters and digits only, case ignored; Levenshtein).
+function Get-NameSimilarity {
+    param([string]$First, [string]$Second)
+    $x = ([string]$First).ToLowerInvariant() -replace '[^a-z0-9]', ''
+    $y = ([string]$Second).ToLowerInvariant() -replace '[^a-z0-9]', ''
+    if (-not $x -or -not $y) { return 0.0 }
+    if ($x -eq $y) { return 1.0 }
+    $n = $x.Length; $m = $y.Length
+    $prev = New-Object 'int[]' ($m + 1); $cur = New-Object 'int[]' ($m + 1)
+    for ($j = 0; $j -le $m; $j++) { $prev[$j] = $j }
+    for ($i = 1; $i -le $n; $i++) {
+        $cur[0] = $i
+        for ($j = 1; $j -le $m; $j++) {
+            $cost = 1; if ($x[$i - 1] -ceq $y[$j - 1]) { $cost = 0 }
+            $v = $prev[$j] + 1
+            if ($cur[$j - 1] + 1 -lt $v) { $v = $cur[$j - 1] + 1 }
+            if ($prev[$j - 1] + $cost -lt $v) { $v = $prev[$j - 1] + $cost }
+            $cur[$j] = $v
+        }
+        $t = $prev; $prev = $cur; $cur = $t
+    }
+    return 1.0 - ($prev[$m] / [double][math]::Max($n, $m))
+}
+function Get-MacKey { param([string]$S) $t = ([string]$S -replace '[^0-9A-Fa-f]', '').ToUpperInvariant(); if ($t.Length -ne 12 -or $t -eq '000000000000' -or $t -eq 'FFFFFFFFFFFF') { return '' } return $t }
+function Get-ShortText { param($S, [int]$Max = 120) $t = ([string]$S).Trim() -replace '\s+', ' '; if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) }; return $t }
+function Write-AiAudit {
+    param([hashtable]$Entry)
+    if ($DryRun) { $Entry['dryRun'] = $true }
+    $Entry['time'] = Get-UtcText; $Entry['run'] = $RunId
+    try { [IO.File]::AppendAllText($AiLogPath, (ConvertTo-Json -InputObject $Entry -Depth 8 -Compress) + [Environment]::NewLine) } catch { }
+}
+# Checks the settings and that Ollama answers and has the model. A settings mistake stops the run;
+# Ollama being down only turns the model off for this run.
+function Test-LocalModel {
+    $u = $null
+    if (-not [Uri]::TryCreate($LmBase, [UriKind]::Absolute, [ref]$u) -or @('http', 'https') -notcontains $u.Scheme) { throw "LocalModel.Endpoint must look like http://localhost:11434 (got '$LmBase')." }
+    $isLocal = @('localhost', '127.0.0.1', '::1', '[::1]') -contains $u.Host.ToLowerInvariant()
+    if (-not $isLocal -and $Lm.AllowRemoteEndpoint -ne $true) { throw "LocalModel.Endpoint '$LmBase' is not on this computer. Device and customer names would be sent there, so it needs LocalModel.AllowRemoteEndpoint set to true." }
+    if (-not [string]$Lm.Model) { throw 'LocalModel.Model is empty (for example "gemma4:12b").' }
+    foreach ($k in 'AutoLinkConfidence', 'ReviewConfidence') { $v = [int]$Lm[$k]; if ($v -lt 1 -or $v -gt 100) { throw "LocalModel.$k must be between 1 and 100." } }
+    if ([int]$Lm.ReviewConfidence -gt [int]$Lm.AutoLinkConfidence) { throw 'LocalModel.ReviewConfidence must not be higher than LocalModel.AutoLinkConfidence.' }
+    try { $tags = Invoke-RestMethod -Method GET -Uri "$LmBase/api/tags" -TimeoutSec 15 -MaximumRedirection 0 }
+    catch { $script:AiDown = "Ollama isn't answering at $LmBase ($($_.Exception.Message)). Check that Ollama is running and that this account can reach it."; return }
+    $names = @($tags.models | ForEach-Object { [string]$_.name; [string]$_.model } | Where-Object { $_ } | Select-Object -Unique)
+    $want = [string]$Lm.Model
+    if (-not @($names | Where-Object { $_ -ieq $want -or $_ -ieq "${want}:latest" }).Count) {
+        $script:AiDown = "Ollama at $LmBase doesn't have the model '$want' (installed: $(if ($names.Count) { $names -join ', ' } else { 'none' })). Run: ollama pull $want"
+        return
+    }
+    $script:AiReady = $true
+    Write-Log "Local AI model '$want' is available at $LmBase."
+}
+function Invoke-LocalModel {
+    param([string]$System, [string]$Prompt, [hashtable]$Schema)
+    $body = [ordered]@{
+        model = [string]$Lm.Model; stream = $false; format = $Schema
+        options = @{ temperature = 0; seed = 7; num_ctx = [int]$Lm.ContextTokens }
+        messages = @(@{ role = 'system'; content = $System }, @{ role = 'user'; content = $Prompt })
+    }
+    if ($Lm.KeepAlive) { $body['keep_alive'] = [string]$Lm.KeepAlive }
+    $json = ConvertTo-Json -InputObject $body -Depth 10 -Compress
+    $r = Invoke-RestMethod -Method POST -Uri "$LmBase/api/chat" -Body ([Text.Encoding]::UTF8.GetBytes($json)) -ContentType 'application/json; charset=utf-8' -TimeoutSec ([int]$Lm.TimeoutSec) -MaximumRedirection 0
+    if (-not $r -or -not $r.message) { throw 'Ollama answered without a message.' }
+    return [string]$r.message.content
+}
+function ConvertFrom-ModelJson {
+    param([string]$Text)
+    $t = ([string]$Text).Trim()
+    $i = $t.IndexOf('{'); $j = $t.LastIndexOf('}')
+    if ($i -lt 0 -or $j -le $i) { throw 'the answer has no JSON object' }
+    return ($t.Substring($i, $j - $i + 1) | ConvertFrom-Json)
+}
+function ConvertTo-Confidence {
+    param($V)
+    $d = 0.0
+    if (-not [double]::TryParse(([string]$V), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { throw "confidence '$V' is not a number" }
+    if ($d -gt 0 -and $d -lt 1) { $d = $d * 100 }   # some models answer 0.95 instead of 95
+    if ($d -lt 0 -or $d -gt 100) { throw "confidence $d is outside 0-100" }
+    return [int][math]::Round($d)
+}
+# Asks the model one question, or reuses the answer to the identical question from an earlier run.
+# Returns @{ status = ok|deferred|error; answer; cached; why }. $Validate turns the parsed JSON into
+# a checked answer hashtable or throws (it gets the parsed JSON and $Context); only checked answers are cached.
+function Get-AiAnswer {
+    param([string]$Kind, [string]$Subject, [string]$System, [string]$Prompt, [hashtable]$Schema, [scriptblock]$Validate, $Context)
+    $key = Get-TextHash "$AiPromptVersion|$($Lm.Model)|$Kind|$System|$Prompt"
+    $script:AiUsedKeys[$key] = $true
+    $hit = $Sync.ai[$key]
+    if ($hit -is [hashtable] -and $hit.answer -is [hashtable]) {
+        $t = ConvertFrom-Utc $hit.askedUtc
+        if ($t -and ([DateTime]::UtcNow - $t).TotalHours -lt [double]$Lm.CacheHours) { return @{ status = 'ok'; answer = $hit.answer; cached = $true; key = $key } }
+    }
+    if ($script:AiDown) { return @{ status = 'error'; why = $script:AiDown } }
+    if (-not $script:AiClock) { $script:AiClock = [Diagnostics.Stopwatch]::StartNew() }
+    if ($script:AiCalls -ge [int]$Lm.MaxCallsPerRun -or $script:AiClock.Elapsed.TotalMinutes -ge [double]$Lm.MaxMinutesPerRun) { return @{ status = 'deferred' } }
+    $script:AiCalls++
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $raw = ''; $answer = $null; $err = ''
+    try { $raw = Invoke-LocalModel -System $System -Prompt $Prompt -Schema $Schema }
+    catch {
+        $err = "Ollama call failed: $($_.Exception.Message)"
+        $script:AiDown = "Ollama stopped answering during the run ($($_.Exception.Message)). If this is a timeout, raise LocalModel.TimeoutSec or use a smaller model."
+    }
+    if (-not $err) {
+        try { $answer = & $Validate (ConvertFrom-ModelJson $raw) $Context; $script:AiBadInRow = 0 }
+        catch {
+            $err = "Invalid answer: $($_.Exception.Message)"
+            $script:AiBadInRow++
+            if ($script:AiBadInRow -ge 3) { $script:AiDown = "The model '$($Lm.Model)' gave 3 invalid answers in a row (last: $($_.Exception.Message))." }
+        }
+    }
+    $sw.Stop()
+    Write-AiAudit @{ type = 'call'; kind = $Kind; subject = $Subject; model = [string]$Lm.Model; key = $key; system = $System; prompt = $Prompt; raw = $raw; answer = $answer; error = $err; ms = $sw.ElapsedMilliseconds }
+    if ($err) { return @{ status = 'error'; why = $err } }
+    $Sync.ai[$key] = @{ askedUtc = Get-UtcText; kind = $Kind; answer = $answer }
+    return @{ status = 'ok'; answer = $answer; cached = $false; key = $key }
+}
+# Compact facts about an IT Glue configuration for a prompt. Only things that rarely change,
+# so the cached answer stays valid.
+function Get-ConfFacts {
+    param($X)
+    $f = [ordered]@{ id = [string]$X.id; name = (Get-Attr $X 'name') }
+    foreach ($p in @(@('hostname', 'hostname'), @('serial', 'serial-number'), @('type', 'configuration-type-name'), @('location', 'location-name'),
+            @('manufacturer', 'manufacturer-name'), @('model', 'model-name'), @('os', 'operating-system-notes'), @('mac', 'mac-address'), @('status', 'configuration-status-name'))) {
+        $v = Get-ShortText (Get-Attr $X $p[1]) 80
+        if ($v) { $f[$p[0]] = $v }
+    }
+    $upd = Get-Attr $X 'updated-at'; if ($upd.Length -ge 10) { $f['last_updated'] = $upd.Substring(0, 10) }
+    $cr = Get-Attr $X 'created-at'; if ($cr.Length -ge 10) { $f['created'] = $cr.Substring(0, 10) }
+    return $f
+}
+
+# =====================================================================================
 # The sync
 # =====================================================================================
 function Invoke-DeviceSync {
-    $stats = [ordered]@{ ncDevices = 0; considered = 0; skippedClass = 0; skippedExcluded = 0; skippedStale = 0; skippedProbe = 0; customerMismatch = 0; siteMismatch = 0; conflicts = 0; waitingForDetails = 0; inSync = 0; toCreate = 0; toUpdate = 0; created = 0; updated = 0; writeFailed = 0; deferred = 0; removed = 0; retired = 0 }
+    $stats = [ordered]@{ ncDevices = 0; considered = 0; skippedClass = 0; skippedExcluded = 0; skippedStale = 0; skippedProbe = 0; customerMismatch = 0; siteMismatch = 0; conflicts = 0; waitingForDetails = 0; inSync = 0; toCreate = 0; toUpdate = 0; created = 0; updated = 0; writeFailed = 0; deferred = 0; removed = 0; retired = 0
+        aiAsked = 0; aiCached = 0; aiLinked = 0; aiReview = 0; aiNoMatch = 0; aiNotAsked = 0; aiArchive = 0; aiDeferred = 0; aiErrors = 0 }
 
     # ---------- Settings that must be right before anything is read ----------
     if ($AllowedUrls -notcontains $BaseUrl) { throw "ITGlueBaseUrl '$BaseUrl' isn't one of $($AllowedUrls -join ', ')." }
@@ -773,6 +991,7 @@ function Invoke-DeviceSync {
         try { $null = [regex]::new([string]$m.Match, 'IgnoreCase') } catch { throw "DeviceClassMap Match '$($m.Match)' isn't a valid regular expression." }
         $classMap += @{ Match = [string]$m.Match; Type = [string]$m.ConfigurationType }
     }
+    if ($UseAI) { Test-LocalModel }   # settings mistakes stop here; Ollama being down only turns the model off
     $ignoreSerial = @{}; foreach ($s in $Cfg.IgnoreSerials) { $ignoreSerial[(Get-SerialKey $s)] = $true }
     $nameMap = @{}; foreach ($k in $Cfg.CustomerNameMap.Keys) { if (-not $k.StartsWith('_')) { $nameMap[(Get-NameKey $k)] = Get-NameKey ([string]$Cfg.CustomerNameMap[$k]) } }
 
@@ -855,10 +1074,14 @@ function Invoke-DeviceSync {
             $null = $anyByOrgName[$k].Add($c)
         }
     }
-    $confById = @{}; $confsBySerial = @{}; $confsByOrgName = @{}
+    $confById = @{}; $confsBySerial = @{}; $confsByOrgName = @{}; $confsByOrg = @{}
+    $orgsHeld = @{}   # organizations with devices that couldn't be matched this run (no archive suggestions there)
     foreach ($c in $confs) {
         if ((Get-Attr $c 'archived') -eq 'True') { continue }
         $confById[[string]$c.id] = $c
+        $coid = Get-Attr $c 'organization-id'
+        if (-not $confsByOrg.ContainsKey($coid)) { $confsByOrg[$coid] = New-Object System.Collections.ArrayList }
+        $null = $confsByOrg[$coid].Add($c)
         $sk = Get-SerialKey (Get-Attr $c 'serial-number')
         if ($sk -and -not $ignoreSerial.ContainsKey($sk)) {
             if (-not $confsBySerial.ContainsKey($sk)) { $confsBySerial[$sk] = New-Object System.Collections.ArrayList }
@@ -941,6 +1164,7 @@ function Invoke-DeviceSync {
         }
         if (-not $loc) {
             $stats.siteMismatch++
+            $orgsHeld[$orgId] = $true
             $sk = "$custId|$siteId"
             if (-not $siteProblems.ContainsKey($sk)) { $siteProblems[$sk] = @{ Customer = $custName; Site = $(if ($siteName) { $siteName } else { '(no site)' }); Why = $why; Devices = New-Object System.Collections.ArrayList; OrgUrl = (Get-Attr $org 'resource-url') } }
             $null = $siteProblems[$sk].Devices.Add($name)
@@ -1030,6 +1254,104 @@ function Invoke-DeviceSync {
     # ---------- 6. Match each device to an IT Glue configuration and plan changes ----------
     $plan = New-Object System.Collections.ArrayList
     $claimed = @{}   # IT Glue configuration id -> N-central id, within this run
+    # Plans the create or update for one device, once its IT Glue configuration ($conf, or $null for
+    # a new one) is known. $how = linked | approved | serial | name | ai.
+    $planDevice = {
+        param($c, $conf, [string]$how)
+        $a = $Sync.assets[$c.Id]; if ($a -isnot [hashtable]) { $a = @{} }
+        $link = $Sync.links[$c.Id]
+        # Desired values. Blank values never clear IT Glue.
+        $want = [ordered]@{}
+        $want['name'] = $c.Name
+        $want['hostname'] = $(if ($c.Hostname) { $c.Hostname } else { $c.Name })
+        $want['serial-number'] = $c.Serial
+        $want['configuration-type-id'] = $typeIds[(Get-NameKey $c.Type)]
+        $want['location-id'] = $c.LocId
+        $os = [string]$a.os; if (-not $os) { $os = $c.OsFallback }
+        $want['operating-system-notes'] = $os
+        $want['mac-address'] = [string]$a.mac
+        $want['primary-ip'] = [string]$a.ip
+        $mid = $null; if ($a.manufacturer) { $mid = $mfrIds[(Get-NameKey ([string]$a.manufacturer))] }
+        $want['manufacturer-id'] = $mid
+        $want['model-id'] = $(if ($mid -and $a.model) { $modelIds["$mid|$(Get-NameKey ([string]$a.model))"] } else { $null })
+
+        $fieldFor = @{ 'name' = 'name'; 'hostname' = 'hostname'; 'serial-number' = 'serial-number'; 'configuration-type-id' = 'configuration-type'; 'location-id' = 'location'; 'operating-system-notes' = 'operating-system-notes'; 'mac-address' = 'mac-address'; 'primary-ip' = 'primary-ip'; 'manufacturer-id' = 'manufacturer'; 'model-id' = 'model' }
+        if (-not $conf) {
+            # Never create a duplicate: no non-archived configuration (linked to another device or not)
+            # may already have this serial number anywhere, or this name/hostname in this organization.
+            $dupWhy = @()
+            if ($c.SerialKey -and $anyBySerial.ContainsKey($c.SerialKey)) {
+                foreach ($x in $anyBySerial[$c.SerialKey]) { $dupWhy += "serial $($c.Serial) is on '$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
+            }
+            foreach ($n in @(@($c.Name, $want['hostname']) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)) {
+                if ($anyByOrgName.ContainsKey("$($c.OrgId)|$n")) {
+                    foreach ($x in $anyByOrgName["$($c.OrgId)|$n"]) { $dupWhy += "name '$n' is on id $($x.id) with serial '$(Get-Attr $x 'serial-number')'" }
+                }
+            }
+            if ($dupWhy.Count -gt 0) {
+                $stats.conflicts++
+                Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not created, it would be a duplicate: $((@($dupWhy | Select-Object -Unique)) -join '; '). Fix the serial/name, or merge or archive the existing one in IT Glue." (Get-Attr $c.Org 'resource-url')
+                return
+            }
+            $attrs = @{ 'organization-id' = [int64]$c.OrgId; 'configuration-status-id' = [int64]$newStatusId }
+            foreach ($f in $want.Keys) { if ($want[$f]) { if ($f -like '*-id') { $attrs[$f] = [int64]$want[$f] } else { $attrs[$f] = [string]$want[$f] } } }
+            $stats.toCreate++
+            $null = $plan.Add([ordered]@{ action = 'create'; ncId = $c.Id; device = $c.Name; customer = $c.CustName; orgId = $c.OrgId; itgId = $null; match = ''; attributes = $attrs; changes = @() })
+            return
+        }
+        $attrs = @{}; $changes = @()
+        foreach ($f in $want.Keys) {
+            if (-not $want[$f]) { continue }
+            if ($Cfg.Sync.UpdateFields -notcontains $fieldFor[$f]) { continue }
+            $have = Get-Attr $conf $f
+            $same = $false
+            if ($f -like '*-id') { $same = ($have -eq [string]$want[$f]) }
+            elseif ($f -eq 'serial-number') { $same = ((Get-SerialKey $have) -eq (Get-SerialKey $want[$f])) }
+            elseif ($f -in @('hostname', 'mac-address')) { $same = ($have.Trim() -ieq ([string]$want[$f]).Trim()) }
+            else { $same = ($have.Trim() -ceq ([string]$want[$f]).Trim()) }
+            if (-not $same) {
+                if ($f -like '*-id') { $attrs[$f] = [int64]$want[$f] } else { $attrs[$f] = [string]$want[$f] }
+                $changes += "$($fieldFor[$f]): '$have' -> '$($want[$f])'"
+            }
+        }
+        # Never rename or re-serial a configuration into a duplicate of another one.
+        $dupWhy = @()
+        foreach ($f in 'name', 'hostname') {
+            if (-not $attrs.ContainsKey($f)) { continue }
+            $others = @(); $nk = "$($c.OrgId)|$(Get-NameKey ([string]$attrs[$f]))"
+            if ($anyByOrgName.ContainsKey($nk)) { $others = @($anyByOrgName[$nk] | Where-Object { [string]$_.id -ne [string]$conf.id }) }
+            if ($others.Count -gt 0) { $dupWhy += "$f '$($attrs[$f])' is already on id $((@($others | ForEach-Object { $_.id })) -join ', ')"; $attrs.Remove($f); $changes = @($changes | Where-Object { -not $_.StartsWith("${f}:") }) }
+        }
+        if ($attrs.ContainsKey('serial-number')) {
+            $others = @(); $sk = Get-SerialKey ([string]$attrs['serial-number'])
+            if ($anyBySerial.ContainsKey($sk)) { $others = @($anyBySerial[$sk] | Where-Object { [string]$_.id -ne [string]$conf.id }) }
+            if ($others.Count -gt 0) { $dupWhy += "serial $($attrs['serial-number']) is already on id $((@($others | ForEach-Object { $_.id })) -join ', ')"; $attrs.Remove('serial-number'); $changes = @($changes | Where-Object { -not $_.StartsWith('serial-number:') }) }
+        }
+        if ($dupWhy.Count -gt 0) {
+            Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not changed, it would make a duplicate: $($dupWhy -join '; ')." (Get-Attr $conf 'resource-url')
+        }
+        if ($changes.Count -eq 0) {
+            $stats.inSync++
+            # A link the local AI model suggested is only saved by an -Apply run.
+            if (($link -isnot [hashtable] -or [string]$link.itg -ne [string]$conf.id) -and ($how -ne 'ai' -or $Apply)) { $Sync.links[$c.Id] = @{ itg = [string]$conf.id; org = $c.OrgId; linkedUtc = Get-UtcText; how = $how } }
+            elseif ($link.diffHash) { $link.diffHash = $null; $link.sends = 0 }
+            return
+        }
+        # A change IT Glue keeps ignoring (e.g. a field locked by another integration) isn't resent forever.
+        $diffHash = Get-TextHash (($changes | Sort-Object) -join ';')
+        if ($link -is [hashtable] -and [string]$link.itg -eq [string]$conf.id -and $link.diffHash -eq $diffHash -and [int]$link.sends -ge [int]$Cfg.Sync.MaxRetries) {
+            $stats.conflicts++
+            Add-Failure 'DeviceConflict' "stuck:$($c.Id)" $c.CustName $c.Name "IT Glue still differs after $($link.sends) updates: $($changes -join '; '). Another integration may own these fields." (Get-Attr $conf 'resource-url')
+            return
+        }
+        $stats.toUpdate++
+        $null = $plan.Add([ordered]@{ action = 'update'; ncId = $c.Id; device = $c.Name; customer = $c.CustName; orgId = $c.OrgId; itgId = [string]$conf.id; url = (Get-Attr $conf 'resource-url'); match = $how; attributes = $attrs; changes = $changes; diffHash = $diffHash })
+    }
+    $aiQueue = New-Object System.Collections.ArrayList
+    # LocalModel.ApprovedMatches: { "N-central device id": "IT Glue configuration id" } that a person confirmed.
+    $approvedMap = @{}; foreach ($k in $Lm.ApprovedMatches.Keys) { if (-not ([string]$k).StartsWith('_')) { $approvedMap[([string]$k).Trim()] = ([string]$Lm.ApprovedMatches[$k]).Trim() } }
+    # LocalModel.RejectedMatches: { "N-central device id": "IT Glue id" or ["id", ...] } that a person said are NOT that device.
+    $rejectedMap = @{}; foreach ($k in $Lm.RejectedMatches.Keys) { if (-not ([string]$k).StartsWith('_')) { $rejectedMap[([string]$k).Trim()] = @(@($Lm.RejectedMatches[$k]) | Where-Object { $_ } | ForEach-Object { ([string]$_).Trim() }) } }
     foreach ($c in $candidates) {
         if ($dupLosers.ContainsKey($c.Id)) { $stats.conflicts++; continue }
         $a = $Sync.assets[$c.Id]; if ($a -isnot [hashtable]) { $a = @{} }
@@ -1037,6 +1359,15 @@ function Invoke-DeviceSync {
         $conf = $null; $how = ''
         # a) The configuration it was linked to before.
         if ($link -is [hashtable] -and $link.itg -and $confById.ContainsKey([string]$link.itg)) { $conf = $confById[[string]$link.itg]; $how = 'linked' }
+        # a2) A match a person approved (LocalModel.ApprovedMatches).
+        if (-not $conf -and $approvedMap.ContainsKey($c.Id)) {
+            $aid = $approvedMap[$c.Id]
+            if (-not $confById.ContainsKey($aid)) {
+                Add-Failure 'AiReview' "approved:$($c.Id)" $c.CustName $c.Name "LocalModel.ApprovedMatches links this device to IT Glue configuration $aid, which doesn't exist or is archived. Fix or remove that entry."
+            } elseif ($linkedConf.ContainsKey($aid) -and $linkedConf[$aid] -ne $c.Id -and $liveIds.ContainsKey([string]$linkedConf[$aid])) {
+                Add-Failure 'AiReview' "approved:$($c.Id)" $c.CustName $c.Name "LocalModel.ApprovedMatches links this device to IT Glue configuration $aid, but that one is already linked to N-central device $($linkedConf[$aid]). Fix or remove that entry." (Get-Attr $confById[$aid] 'resource-url')
+            } else { $conf = $confById[$aid]; $how = 'approved' }
+        }
         # b) Same serial number.
         if (-not $conf -and $c.SerialKey -and $confsBySerial.ContainsKey($c.SerialKey)) {
             $all = @($confsBySerial[$c.SerialKey] | Where-Object { -not $linkedConf.ContainsKey([string]$_.id) -or $linkedConf[[string]$_.id] -eq $c.Id })
@@ -1083,93 +1414,160 @@ function Invoke-DeviceSync {
         if ($conf) { $claimed[[string]$conf.id] = $c.Id }
 
         # New devices wait for their serial number, so a duplicate isn't created.
-        if (-not $conf -and $Cfg.NCentral.AssetDetails -and -not $a.fetchedUtc) { $stats.waitingForDetails++; continue }
+        if (-not $conf -and $Cfg.NCentral.AssetDetails -and -not $a.fetchedUtc) { $stats.waitingForDetails++; $orgsHeld[$c.OrgId] = $true; continue }
 
-        # Desired values. Blank values never clear IT Glue.
-        $want = [ordered]@{}
-        $want['name'] = $c.Name
-        $want['hostname'] = $(if ($c.Hostname) { $c.Hostname } else { $c.Name })
-        $want['serial-number'] = $c.Serial
-        $want['configuration-type-id'] = $typeIds[(Get-NameKey $c.Type)]
-        $want['location-id'] = $c.LocId
-        $os = [string]$a.os; if (-not $os) { $os = $c.OsFallback }
-        $want['operating-system-notes'] = $os
-        $want['mac-address'] = [string]$a.mac
-        $want['primary-ip'] = [string]$a.ip
-        $mid = $null; if ($a.manufacturer) { $mid = $mfrIds[(Get-NameKey ([string]$a.manufacturer))] }
-        $want['manufacturer-id'] = $mid
-        $want['model-id'] = $(if ($mid -and $a.model) { $modelIds["$mid|$(Get-NameKey ([string]$a.model))"] } else { $null })
+        # No serial/name match: the local AI model gets a look first, after every exact match is known.
+        if (-not $conf -and $script:AiReady -and -not $script:AiDown -and (-not $Limited -or $DeviceId -contains $c.Id)) { $null = $aiQueue.Add($c); continue }
+        $null = & $planDevice $c $conf $how
+    }
 
-        $fieldFor = @{ 'name' = 'name'; 'hostname' = 'hostname'; 'serial-number' = 'serial-number'; 'configuration-type-id' = 'configuration-type'; 'location-id' = 'location'; 'operating-system-notes' = 'operating-system-notes'; 'mac-address' = 'mac-address'; 'primary-ip' = 'primary-ip'; 'manufacturer-id' = 'manufacturer'; 'model-id' = 'model' }
-        if (-not $conf) {
-            # Never create a duplicate: no non-archived configuration (linked to another device or not)
-            # may already have this serial number anywhere, or this name/hostname in this organization.
-            $dupWhy = @()
-            if ($c.SerialKey -and $anyBySerial.ContainsKey($c.SerialKey)) {
-                foreach ($x in $anyBySerial[$c.SerialKey]) { $dupWhy += "serial $($c.Serial) is on '$(Get-Attr $x 'name')' (id $($x.id), $(Get-Attr $x 'organization-name'))" }
+
+    # ---------- 6b. Optional: ask the local AI model about devices with no serial/name match ----------
+    # One device at a time, with a short list of non-archived IT Glue configurations at the same
+    # customer that aren't already taken. The script checks the answer and decides.
+    $aiDecisions = New-Object System.Collections.ArrayList
+    $aiSuggested = @{}   # IT Glue configuration ids held for a person to check this run
+    foreach ($c in @($aiQueue | Sort-Object @{ Expression = { [string]$_.Id } })) {
+        $a = $Sync.assets[$c.Id]; if ($a -isnot [hashtable]) { $a = @{} }
+        $macKey = Get-MacKey ([string]$a.mac)
+        $rej = @(); if ($rejectedMap.ContainsKey($c.Id)) { $rej = @($rejectedMap[$c.Id]) }
+        $scored = New-Object System.Collections.ArrayList
+        $pool = @(); if ($confsByOrg.ContainsKey($c.OrgId)) { $pool = @($confsByOrg[$c.OrgId]) }
+        foreach ($x in $pool) {
+            $xid = [string]$x.id
+            if ($claimed.ContainsKey($xid) -or $rej -contains $xid) { continue }
+            # Taken by another device that is still in N-central. (A link to a device that is gone
+            # stays a candidate: that is often the same computer with a reinstalled agent.)
+            if ($linkedConf.ContainsKey($xid) -and $linkedConf[$xid] -ne $c.Id -and $liveIds.ContainsKey([string]$linkedConf[$xid])) { continue }
+            $xs = Get-SerialKey (Get-Attr $x 'serial-number'); if ($ignoreSerial.ContainsKey($xs)) { $xs = '' }
+            if ($c.SerialKey -and $xs -and $xs -ne $c.SerialKey) { continue }   # different serial = different device
+            $sim = 0.0
+            foreach ($dn in @(@($c.Name, $c.Hostname) | Where-Object { $_ })) {
+                foreach ($cn in @(@((Get-Attr $x 'name'), (Get-Attr $x 'hostname')) | Where-Object { $_ })) { $sv = Get-NameSimilarity $dn $cn; if ($sv -gt $sim) { $sim = $sv } }
             }
-            foreach ($n in @(@($c.Name, $want['hostname']) | Where-Object { $_ } | ForEach-Object { Get-NameKey $_ } | Select-Object -Unique)) {
-                if ($anyByOrgName.ContainsKey("$($c.OrgId)|$n")) {
-                    foreach ($x in $anyByOrgName["$($c.OrgId)|$n"]) { $dupWhy += "name '$n' is on id $($x.id) with serial '$(Get-Attr $x 'serial-number')'" }
+            $mm = [bool]($macKey -and (Get-MacKey (Get-Attr $x 'mac-address')) -eq $macKey)
+            $null = $scored.Add(@{ Conf = $x; Sim = $sim; Mac = $mm; Score = ($sim + $(if ($mm) { 1 } else { 0 })) })
+        }
+        $top = @($scored | Sort-Object @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { [int64]$_.Conf.id } } | Select-Object -First ([math]::Max(1, [int]$Lm.MaxCandidates)))
+        if ($top.Count -eq 0 -or ($top[0].Sim -lt [double]$Lm.MinNameSimilarity -and -not $top[0].Mac)) {
+            # Nothing looks remotely like it: a new device. Not worth a question.
+            $stats.aiNotAsked++
+            $null = & $planDevice $c $null ''
+            continue
+        }
+        $dev = [ordered]@{ name = $c.Name }
+        foreach ($p in @(@('hostname', $c.Hostname), @('serial', $c.Serial), @('manufacturer', $a.manufacturer), @('model', $a.model), @('os', $(if ($a.os) { $a.os } else { $c.OsFallback })), @('mac', $a.mac), @('n_central_class', $c.Class), @('it_glue_type', $c.Type), @('site', (Get-Attr $c.Loc 'name')))) {
+            $v = Get-ShortText $p[1] 80; if ($v) { $dev[$p[0]] = $v }
+        }
+        $cl = @($top | ForEach-Object { Get-ConfFacts $_.Conf })
+        $prompt = "N-central device:`n$(ConvertTo-Json -InputObject $dev -Depth 3 -Compress)`n`nIT Glue configurations at the same customer ($(Get-Attr $c.Org 'name')), archived ones left out:`n$(ConvertTo-Json -InputObject $cl -Depth 3 -Compress)"
+        $ids = @($top | ForEach-Object { [string]$_.Conf.id })
+        $validate = {
+            param($o, $ids)
+            if (-not $o.PSObject.Properties['match_id'] -or -not $o.PSObject.Properties['confidence']) { throw 'match_id or confidence is missing' }
+            $mid = ([string]$o.match_id).Trim()
+            if (@('none', 'null', '0', 'n/a') -contains $mid.ToLowerInvariant()) { $mid = '' }
+            if ($mid -and $ids -notcontains $mid) { throw "match_id '$mid' is not one of the candidates" }
+            $cf = ConvertTo-Confidence $o.confidence
+            if (-not $mid) { $cf = 0 }
+            return @{ match_id = $mid; confidence = $cf; reason = (Get-ShortText $o.reason 300) }
+        }
+        $r = Get-AiAnswer -Kind 'match' -Subject "N-central $($c.Id) $($c.Name)" -System $AiMatchSystem -Prompt $prompt -Schema $AiMatchSchema -Validate $validate -Context $ids
+        if ($r.status -eq 'deferred') {
+            # Not created this run, so a duplicate can't slip in; asked on the next run.
+            $stats.aiDeferred++; $orgsHeld[$c.OrgId] = $true
+            continue
+        }
+        if ($r.status -eq 'error') {
+            $stats.aiErrors++; $orgsHeld[$c.OrgId] = $true
+            Write-Log "Local AI couldn't check $($c.CustName) | $($c.Name), so it is matched without it: $($r.why)" 'WARN'
+            $null = & $planDevice $c $null ''
+            continue
+        }
+        if ($r.cached) { $stats.aiCached++ } else { $stats.aiAsked++ }
+        $ans = $r.answer
+        $mid = [string]$ans.match_id; $cf = [int]$ans.confidence
+        $pick = $null
+        if ($mid) { foreach ($t in $top) { if ([string]$t.Conf.id -eq $mid) { $pick = $t.Conf } } }
+        if ($pick -and $claimed.ContainsKey($mid)) { $pick = $null }   # taken by another device meanwhile
+        $action = 'none'
+        if ($pick -and $Lm.AutoLink -eq $true -and $cf -ge [int]$Lm.AutoLinkConfidence) {
+            $action = 'link'; $stats.aiLinked++
+            Write-Log "Local AI: $($c.CustName) | $($c.Name) is IT Glue '$(Get-Attr $pick 'name')' (id $mid), confidence $cf. $($ans.reason)"
+            $claimed[$mid] = $c.Id
+            $null = & $planDevice $c $pick 'ai'
+        } elseif ($pick -and $cf -ge [int]$Lm.ReviewConfidence) {
+            $action = 'review'; $stats.aiReview++; $aiSuggested[$mid] = $true; $orgsHeld[$c.OrgId] = $true
+            Add-Failure 'AiReview' "aimatch:$($c.Id)" $c.CustName $c.Name ("Not created or linked: possibly the same device as IT Glue configuration '{0}' (id {1}), confidence {2}. {3} To accept, add `"{4}`": `"{1}`" to LocalModel.ApprovedMatches in the config. If it's a different device, add the same line to LocalModel.RejectedMatches." -f (Get-Attr $pick 'name'), $mid, $cf, $ans.reason, $c.Id) (Get-Attr $pick 'resource-url')
+        } else {
+            $stats.aiNoMatch++
+            $null = & $planDevice $c $null ''
+        }
+        $d = [ordered]@{ kind = 'match'; action = $action; ncId = $c.Id; device = $c.Name; customer = $c.CustName; itgId = $mid; itgName = $(if ($pick) { Get-Attr $pick 'name' } else { '' }); confidence = $cf; reason = [string]$ans.reason; cached = [bool]$r.cached }
+        $null = $aiDecisions.Add($d)
+        Write-AiAudit @{ type = 'decision'; kind = 'match'; action = $action; ncId = $c.Id; device = $c.Name; customer = $c.CustName; itgId = $mid; confidence = $cf; reason = [string]$ans.reason; cached = [bool]$r.cached; key = $r.key; apply = [bool]$Apply }
+    }
+
+    # ---------- 6c. Optional: IT Glue configurations the local AI model thinks are retired ----------
+    # Only for customers whose devices were all matched this run, only for configuration types
+    # this sync manages, and only records no N-central device is linked to or named like. The
+    # model only suggests; nothing is archived by this script.
+    if ($script:AiReady -and -not $script:AiDown -and $Lm.SuggestArchive -eq $true -and -not $Limited) {
+        $deviceTypeIds = @{}; foreach ($m in $classMap) { $deviceTypeIds[[string]$typeIds[(Get-NameKey $m.Type)]] = $true }
+        $ncByOrg = @{}
+        foreach ($c in $candidates) { if (-not $ncByOrg.ContainsKey($c.OrgId)) { $ncByOrg[$c.OrgId] = New-Object System.Collections.ArrayList }; $null = $ncByOrg[$c.OrgId].Add($c) }
+        $month = (Get-Date).ToString('yyyy-MM')
+        foreach ($oid in @($ncByOrg.Keys | Sort-Object)) {
+            if ($orgsHeld.ContainsKey($oid) -or -not $confsByOrg.ContainsKey($oid)) { continue }
+            $ncNames = @{}
+            foreach ($c in $ncByOrg[$oid]) { foreach ($n in @(@($c.Name, $c.Hostname) | Where-Object { $_ })) { $ncNames[(Get-NameKey $n)] = $true } }
+            foreach ($x in @($confsByOrg[$oid])) {
+                $xid = [string]$x.id
+                if (-not $deviceTypeIds.ContainsKey((Get-Attr $x 'configuration-type-id'))) { continue }
+                if ($claimed.ContainsKey($xid) -or $linkedConf.ContainsKey($xid) -or $aiSuggested.ContainsKey($xid) -or $Lm.KeepConfigurationIds -contains $xid) { continue }
+                $xh = Get-Attr $x 'hostname'
+                if ($ncNames.ContainsKey((Get-NameKey (Get-Attr $x 'name'))) -or ($xh -and $ncNames.ContainsKey((Get-NameKey $xh)))) { continue }
+                $near = @($ncByOrg[$oid] | ForEach-Object {
+                        $c = $_; $sim = 0.0
+                        foreach ($dn in @(@($c.Name, $c.Hostname) | Where-Object { $_ })) { foreach ($cn in @(@((Get-Attr $x 'name'), $xh) | Where-Object { $_ })) { $sv = Get-NameSimilarity $dn $cn; if ($sv -gt $sim) { $sim = $sv } } }
+                        @{ Sim = $sim; C = $c }
+                    } | Sort-Object @{ Expression = { $_.Sim }; Descending = $true }, @{ Expression = { [string]$_.C.Name } } | Select-Object -First 10 | ForEach-Object {
+                        $f = [ordered]@{ name = $_.C.Name; type = $_.C.Type }
+                        if ($_.C.Serial) { $f['serial'] = $_.C.Serial }
+                        $f
+                    })
+                $prompt = "Current month: $month`nCustomer: $(Get-Attr $x 'organization-name') ($($ncByOrg[$oid].Count) computers/servers in N-central)`n`nIT Glue configuration not linked to any N-central device:`n$(ConvertTo-Json -InputObject (Get-ConfFacts $x) -Depth 3 -Compress)`n`nN-central devices at this customer with the most similar names:`n$(ConvertTo-Json -InputObject $near -Depth 3 -Compress)"
+                $validate = {
+                    param($o, $unused)
+                    if (-not $o.PSObject.Properties['archive'] -or -not $o.PSObject.Properties['confidence']) { throw 'archive or confidence is missing' }
+                    $arch = $null
+                    if ($o.archive -is [bool]) { $arch = $o.archive } elseif (@('true', 'yes') -contains ([string]$o.archive).ToLowerInvariant()) { $arch = $true } elseif (@('false', 'no') -contains ([string]$o.archive).ToLowerInvariant()) { $arch = $false }
+                    if ($null -eq $arch) { throw "archive '$($o.archive)' is not true or false" }
+                    return @{ archive = $arch; confidence = (ConvertTo-Confidence $o.confidence); reason = (Get-ShortText $o.reason 300) }
                 }
-            }
-            if ($dupWhy.Count -gt 0) {
-                $stats.conflicts++
-                Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not created, it would be a duplicate: $((@($dupWhy | Select-Object -Unique)) -join '; '). Fix the serial/name, or merge or archive the existing one in IT Glue." (Get-Attr $c.Org 'resource-url')
-                continue
-            }
-            $attrs = @{ 'organization-id' = [int64]$c.OrgId; 'configuration-status-id' = [int64]$newStatusId }
-            foreach ($f in $want.Keys) { if ($want[$f]) { if ($f -like '*-id') { $attrs[$f] = [int64]$want[$f] } else { $attrs[$f] = [string]$want[$f] } } }
-            $stats.toCreate++
-            $null = $plan.Add([ordered]@{ action = 'create'; ncId = $c.Id; device = $c.Name; customer = $c.CustName; orgId = $c.OrgId; itgId = $null; match = ''; attributes = $attrs; changes = @() })
-            continue
-        }
-        $attrs = @{}; $changes = @()
-        foreach ($f in $want.Keys) {
-            if (-not $want[$f]) { continue }
-            if ($Cfg.Sync.UpdateFields -notcontains $fieldFor[$f]) { continue }
-            $have = Get-Attr $conf $f
-            $same = $false
-            if ($f -like '*-id') { $same = ($have -eq [string]$want[$f]) }
-            elseif ($f -eq 'serial-number') { $same = ((Get-SerialKey $have) -eq (Get-SerialKey $want[$f])) }
-            elseif ($f -in @('hostname', 'mac-address')) { $same = ($have.Trim() -ieq ([string]$want[$f]).Trim()) }
-            else { $same = ($have.Trim() -ceq ([string]$want[$f]).Trim()) }
-            if (-not $same) {
-                if ($f -like '*-id') { $attrs[$f] = [int64]$want[$f] } else { $attrs[$f] = [string]$want[$f] }
-                $changes += "$($fieldFor[$f]): '$have' -> '$($want[$f])'"
+                $r = Get-AiAnswer -Kind 'archive' -Subject "IT Glue $xid $(Get-Attr $x 'name')" -System $AiArchiveSystem -Prompt $prompt -Schema $AiArchiveSchema -Validate $validate -Context $null
+                if ($r.status -eq 'deferred') { $stats.aiDeferred++; continue }
+                if ($r.status -ne 'ok') { $stats.aiErrors++; continue }
+                if ($r.cached) { $stats.aiCached++ } else { $stats.aiAsked++ }
+                $ans = $r.answer
+                $suggest = ($ans.archive -eq $true -and [int]$ans.confidence -ge [int]$Lm.ReviewConfidence)
+                if ($suggest) {
+                    $stats.aiArchive++
+                    Add-Failure 'AiArchive' "aiarchive:$xid" (Get-Attr $x 'organization-name') (Get-Attr $x 'name') ("Consider archiving (confidence {0}). {1} No N-central device is linked to it. Archive it in IT Glue if it's retired, or add {2} to LocalModel.KeepConfigurationIds to stop this suggestion." -f $ans.confidence, $ans.reason, $xid) (Get-Attr $x 'resource-url')
+                }
+                $null = $aiDecisions.Add([ordered]@{ kind = 'archive'; action = $(if ($suggest) { 'suggest-archive' } else { 'keep' }); itgId = $xid; itgName = (Get-Attr $x 'name'); customer = (Get-Attr $x 'organization-name'); confidence = [int]$ans.confidence; reason = [string]$ans.reason; cached = [bool]$r.cached })
+                if (-not $r.cached) { Write-AiAudit @{ type = 'decision'; kind = 'archive'; action = $(if ($suggest) { 'suggest-archive' } else { 'keep' }); itgId = $xid; name = (Get-Attr $x 'name'); customer = (Get-Attr $x 'organization-name'); confidence = [int]$ans.confidence; reason = [string]$ans.reason; key = $r.key } }
             }
         }
-        # Never rename or re-serial a configuration into a duplicate of another one.
-        $dupWhy = @()
-        foreach ($f in 'name', 'hostname') {
-            if (-not $attrs.ContainsKey($f)) { continue }
-            $others = @(); $nk = "$($c.OrgId)|$(Get-NameKey ([string]$attrs[$f]))"
-            if ($anyByOrgName.ContainsKey($nk)) { $others = @($anyByOrgName[$nk] | Where-Object { [string]$_.id -ne [string]$conf.id }) }
-            if ($others.Count -gt 0) { $dupWhy += "$f '$($attrs[$f])' is already on id $((@($others | ForEach-Object { $_.id })) -join ', ')"; $attrs.Remove($f); $changes = @($changes | Where-Object { -not $_.StartsWith("${f}:") }) }
+    }
+    if ($UseAI) {
+        if ($script:AiDown) {
+            Write-Log "Local AI model not used (or stopped): $($script:AiDown)" 'WARN'
+            Add-Failure 'AiReview' 'ai:unavailable' '(all)' 'Local AI model not available' "$($script:AiDown) Devices were matched the usual way (serial number and name only) this run."
         }
-        if ($attrs.ContainsKey('serial-number')) {
-            $others = @(); $sk = Get-SerialKey ([string]$attrs['serial-number'])
-            if ($anyBySerial.ContainsKey($sk)) { $others = @($anyBySerial[$sk] | Where-Object { [string]$_.id -ne [string]$conf.id }) }
-            if ($others.Count -gt 0) { $dupWhy += "serial $($attrs['serial-number']) is already on id $((@($others | ForEach-Object { $_.id })) -join ', ')"; $attrs.Remove('serial-number'); $changes = @($changes | Where-Object { -not $_.StartsWith('serial-number:') }) }
-        }
-        if ($dupWhy.Count -gt 0) {
-            Add-Failure 'DeviceConflict' "wouldduplicate:$($c.Id)" $c.CustName $c.Name "Not changed, it would make a duplicate: $($dupWhy -join '; ')." (Get-Attr $conf 'resource-url')
-        }
-        if ($changes.Count -eq 0) {
-            $stats.inSync++
-            if ($link -isnot [hashtable] -or [string]$link.itg -ne [string]$conf.id) { $Sync.links[$c.Id] = @{ itg = [string]$conf.id; org = $c.OrgId; linkedUtc = Get-UtcText; how = $how } }
-            elseif ($link.diffHash) { $link.diffHash = $null; $link.sends = 0 }
-            continue
-        }
-        # A change IT Glue keeps ignoring (e.g. a field locked by another integration) isn't resent forever.
-        $diffHash = Get-TextHash (($changes | Sort-Object) -join ';')
-        if ($link -is [hashtable] -and [string]$link.itg -eq [string]$conf.id -and $link.diffHash -eq $diffHash -and [int]$link.sends -ge [int]$Cfg.Sync.MaxRetries) {
-            $stats.conflicts++
-            Add-Failure 'DeviceConflict' "stuck:$($c.Id)" $c.CustName $c.Name "IT Glue still differs after $($link.sends) updates: $($changes -join '; '). Another integration may own these fields." (Get-Attr $conf 'resource-url')
-            continue
-        }
-        $stats.toUpdate++
-        $null = $plan.Add([ordered]@{ action = 'update'; ncId = $c.Id; device = $c.Name; customer = $c.CustName; orgId = $c.OrgId; itgId = [string]$conf.id; url = (Get-Attr $conf 'resource-url'); match = $how; attributes = $attrs; changes = $changes; diffHash = $diffHash })
+        # Forget cached answers to questions that weren't asked this run (the facts changed).
+        if ($script:AiReady -and -not $script:AiDown -and -not $Limited) { foreach ($k in @($Sync.ai.Keys)) { if (-not $script:AiUsedKeys.ContainsKey($k)) { $Sync.ai.Remove($k) } } }
+        Write-Log ("Local AI: {0} asked, {1} answers reused, {2} linked, {3} held for review, {4} no match, {5} not asked (no similar names), {6} archive suggestions, {7} left for the next run, {8} errors." -f $stats.aiAsked, $stats.aiCached, $stats.aiLinked, $stats.aiReview, $stats.aiNoMatch, $stats.aiNotAsked, $stats.aiArchive, $stats.aiDeferred, $stats.aiErrors)
     }
 
     # ---------- 7. Devices synced before that are no longer in N-central ----------
@@ -1180,6 +1578,7 @@ function Invoke-DeviceSync {
             $lk = $Sync.links[$nid]
             if ($lk -isnot [hashtable] -or -not $confById.ContainsKey([string]$lk.itg)) { $Sync.links.Remove($nid); continue }   # archived or deleted in IT Glue: forget the link (archived records are ignored)
             $conf = $confById[[string]$lk.itg]
+            if ($claimed.ContainsKey([string]$lk.itg)) { continue }   # now matched to a live device (e.g. agent reinstalled, new N-central id)
             if ($lk.retiredUtc -and (Get-Attr $conf 'configuration-status-id') -eq [string]$retiredStatusId) { continue }
             $stats.removed++
             if ($retiredStatusId) {
@@ -1205,9 +1604,10 @@ function Invoke-DeviceSync {
                 creates = @($work | Where-Object { $_.action -eq 'create' }); updates = @($work | Where-Object { $_.action -eq 'update' })
                 retire = @($retire | ForEach-Object { @{ ncId = $_.ncId; itgId = $_.conf.id; name = (Get-Attr $_.conf 'name'); organization = (Get-Attr $_.conf 'organization-name') } })
                 retireBlocked = $retireBlocked
+                localModel = [ordered]@{ enabled = $UseAI; model = [string]$Lm.Model; available = [bool]($script:AiReady -and -not $script:AiDown); problem = $script:AiDown; decisions = @($aiDecisions) }
             })
     } catch { Write-Log "Couldn't write $PreviewPath : $($_.Exception.Message)" 'WARN' }
-    Write-Log ("Plan: {0} to create, {1} to update, {2} already match, {3} new devices waiting for hardware details, {4} conflicts, {5} removed from N-central. Details: {6}" -f $stats.toCreate, $stats.toUpdate, $stats.inSync, $stats.waitingForDetails, $stats.conflicts, $stats.removed, $PreviewPath)
+    Write-Log ("Plan: {0} to create, {1} to update, {2} already match, {3} new devices waiting for hardware details, {4} conflicts, {5} removed from N-central, {6} held for a local AI check or review. Details: {7}" -f $stats.toCreate, $stats.toUpdate, $stats.inSync, $stats.waitingForDetails, $stats.conflicts, $stats.removed, ($stats.aiReview + $stats.aiDeferred), $PreviewPath)
 
     # ---------- 9. Apply ----------
     $writeFailures = 0
@@ -1241,7 +1641,9 @@ function Invoke-DeviceSync {
                     $linkedUtc = Get-UtcText; if ($prev -is [hashtable] -and $prev.linkedUtc) { $linkedUtc = $prev.linkedUtc }
                     $Sync.links[$p.ncId] = @{ itg = $p.itgId; org = $p.orgId; linkedUtc = $linkedUtc; how = $p.match; diffHash = $p.diffHash; sends = $sends }
                     $stats.updated++
-                    Write-Log "UPDATED $($p.customer) | $($p.device) (IT Glue $($p.itgId)): $($p.changes -join '; ')" 'CHANGE'
+                    $note = ''; if ($p.match -eq 'ai') { $note = ' [matched by the local AI model]' } elseif ($p.match -eq 'approved') { $note = ' [match approved in LocalModel.ApprovedMatches]' }
+                    Write-Log "UPDATED $($p.customer) | $($p.device) (IT Glue $($p.itgId))${note}: $($p.changes -join '; ')" 'CHANGE'
+                    if ($p.match -eq 'ai') { Write-AiAudit @{ type = 'applied'; ncId = $p.ncId; device = $p.device; itgId = $p.itgId; changes = @($p.changes) } }
                 }
             } catch {
                 $writeFailures++; $stats.writeFailed++
@@ -1311,6 +1713,7 @@ function Invoke-Main {
     foreach ($f in $Failures) { if (-not $current.ContainsKey($f.Key)) { $current[$f.Key] = $f } }
     foreach ($ck in $CheckNames.Keys) {
         $n = @($current.Values | Where-Object { $_.Check -eq $ck }).Count
+        if (-not $UseAI -and $ck -like 'Ai*' -and $n -eq 0) { continue }
         Write-Log ("{0}: {1}" -f $CheckNames[$ck], $(if ($n -eq 0) { 'OK' } else { "$n problem(s)" })) $(if ($n -eq 0) { 'INFO' } else { 'PROBLEM' })
     }
     $exitCode = $EXIT_OK
@@ -1353,12 +1756,18 @@ function Invoke-Main {
         $rows = ''
         foreach ($ck in $CheckNames.Keys) {
             $n = @($current.Values | Where-Object { $_.Check -eq $ck }).Count
+            if (-not $UseAI -and $ck -like 'Ai*' -and $n -eq 0) { continue }
             $res = 'OK'; $col = '#2e7d32'; if ($n -gt 0) { $res = "$n problem(s)"; $col = '#c62828' }
             $rows += "<tr><td>$(Get-HtmlText $CheckNames[$ck])</td><td style='color:$col'><b>$res</b></td></tr>"
         }
         $html = "<div style='font-family:Segoe UI,Arial,sans-serif;font-size:14px'>"
         $html += "<p>N-central to IT Glue device sync at $(Get-Date -Format 'yyyy-MM-dd HH:mm') from $(Get-HtmlText $env:COMPUTERNAME). $(Get-HtmlText $modeText)</p>"
         $html += "<p>$($s.ncDevices) devices in N-central, $($s.considered) to sync, $($s.inSync) already match, $($s.customerMismatch + $s.siteMismatch) not synced because the customer or site doesn't match IT Glue.</p>"
+        if ($UseAI) {
+            $aiText = "Local AI model ($($Lm.Model)): $($s.aiAsked) asked, $($s.aiCached) answers reused, $($s.aiLinked) linked$(if (-not $Apply) { ' (not saved: report only)' }), $($s.aiReview) held for you to check, $($s.aiArchive) archive suggestions, $($s.aiDeferred) left for the next run, $($s.aiErrors) errors."
+            if ($script:AiDown) { $aiText += " Not available this run, so devices were matched the usual way: $($script:AiDown)" }
+            $html += "<p style='color:#444'>$(Get-HtmlText $aiText)</p>"
+        }
         if ($recovered) { $html += "<p><b>The sync is running again</b> after $([int]$State.ConsecutiveErrors) failed run(s).</p>" }
         $html += "<table cellpadding='4' style='font-size:14px'>$rows</table>"
         $html += Get-SectionHtml 'New problems' $new '#c62828'

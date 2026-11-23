@@ -12,9 +12,10 @@ sites and contacts, so this script **never creates, renames or changes an IT Glu
 or location**. It only creates and updates IT Glue Configurations, and it never deletes or
 archives anything.
 
-> **Status: v0.3, not yet tested against live N-central or IT Glue.** The N-central field names
+> **Status: v0.4, not yet tested against live N-central or IT Glue.** The N-central field names
 > (especially the hardware details from `/api/devices/{id}/assets`) are based on N-able's API
-> documentation and need checking on the first dry run. Follow "First run" below.
+> documentation and need checking on the first dry run. Follow "First run" below. The optional
+> local AI model mode (v0.4) has not been run against Ollama yet either.
 
 ## The key rule: customer and site must match
 
@@ -48,6 +49,8 @@ internal one), use `NCentral.ExcludeCustomerIds` or `ExcludeCustomerNames`.
 | 3 | Can't match safely | Creating or renaming would make a duplicate (see "No duplicates"); two N-central devices with the same serial or name (the older one is skipped and the newest check-in wins); several IT Glue configurations with the same serial or name; the serial is on a configuration under a **different** organization; the device moved customer in N-central; or IT Glue keeps ignoring an update after `MaxRetries` (3). Nothing is changed for these. |
 | 4 | IT Glue refused | A create or update was refused (with IT Glue's error). Retried next run. |
 | 5 | Gone from N-central | A device synced before is no longer in N-central. Report only by default; `RetiredDeviceAction: "SetStatus"` sets its status to `RetiredStatus` instead. |
+| 6 | Local AI: check this match | Only with the local AI model on. The model thinks a new N-central device may be an existing IT Glue configuration with a different name, but isn't sure enough to link it. The device is held (not created). Also: the model isn't available this run, or an `ApprovedMatches` entry is wrong. |
+| 7 | Local AI: consider archiving | Only with the local AI model on. An IT Glue computer/server record that no N-central device is linked to and that the model thinks is retired. A suggestion only; the script never archives. |
 
 ## How a device is matched to an IT Glue configuration
 
@@ -56,7 +59,9 @@ internal one), use `NCentral.ExcludeCustomerIds` or `ExcludeCustomerNames`.
    Placeholder serials like "To Be Filled By O.E.M." are ignored (`IgnoreSerials`).
 3. Otherwise one in the same organization with the same **name or hostname**, if the serial
    numbers don't disagree (`Sync.MatchByName`).
-4. Otherwise a new configuration is created. A new device waits until its serial number has been
+4. Optional, only with the local AI model on: the model is asked whether one of the customer's
+   existing configurations is the same device under a different name (see below).
+5. Otherwise a new configuration is created. A new device waits until its serial number has been
    read from N-central, so it isn't created twice.
 
 What's written:
@@ -76,6 +81,52 @@ What's written:
 A value that is blank in N-central never clears IT Glue. The organization of an existing
 configuration is never changed. Devices whose class isn't in `DeviceClassMap` (printers, network
 devices, probes...) are skipped.
+
+## Optional: local AI model (Ollama)
+
+Off by default. Turn it on for one run with `-UseLocalModel`, or for the scheduled task with
+`"LocalModel": { "Enabled": true }` in the config. It needs [Ollama](https://ollama.com) running on
+the same computer (default `http://localhost:11434`) with the model pulled (default
+`gemma4:12b`). The script talks to Ollama's API directly; OpenCode isn't involved.
+
+**The script decides, the model only suggests.** Exact matching (link, serial, name) always runs
+first. Only the devices still unmatched go to the model, **one device at a time**, with up to
+`MaxCandidates` (15) **non-archived** IT Glue configurations from the **same organization**. The
+candidates are pre-filtered by the script: not already linked to another device that is in
+N-central, not matched to another device this run, no serial number that disagrees, and ranked by
+how alike the names are (and a matching MAC address). If no candidate's name is at least
+`MinNameSimilarity` (0.3) alike and no MAC matches, the model isn't asked: it's a new device.
+
+The model must answer strict JSON (Ollama's `format` JSON schema, temperature 0):
+`match_id` (a candidate id or empty), `confidence` (0 to 100) and `reason`. The script checks
+that the id is one of the candidates it sent, then:
+
+| Answer | What the script does |
+|---|---|
+| A candidate with confidence >= `AutoLinkConfidence` (90) and `AutoLink` true | Treats it as the match. It's then updated from N-central like any matched device (name, serial, ...), still with every duplicate check, `-Apply`, `MaxChangesPerRun`/`-ChangeLimit`. Without `-Apply` it's only shown in the plan and the link isn't saved. |
+| A candidate with confidence >= `ReviewConfidence` (60) | **Held**: not created and not linked. Reported in check 6 with both ids. To accept, add `"<N-central id>": "<IT Glue id>"` to `LocalModel.ApprovedMatches`; to reject, add the same line to `LocalModel.RejectedMatches` (then it's created next run if nothing else matches). |
+| No match, or lower confidence | Same as without the model: a new configuration is created (with all the duplicate checks). |
+| Ollama down, timeout, or an invalid answer | Same as without the model, and check 6 says the model wasn't available. Three invalid answers in a row or one failed call turns the model off for the rest of the run. |
+
+**Archive suggestions** (`SuggestArchive`, on): for each organization whose devices all matched
+this run, every non-archived IT Glue configuration of a type the sync manages (Server, Laptop,
+Workstation) that no N-central device is linked to or named like is shown to the model with the
+10 most similar N-central device names. "Archive, with confidence >= `ReviewConfidence`" is
+reported in check 7. Nothing is archived. To silence one, add its IT Glue id to
+`KeepConfigurationIds`.
+
+Limits: at most `MaxCallsPerRun` (100) questions and `MaxMinutesPerRun` (20) minutes of model time
+per run. A device that couldn't be asked because of a limit is held until the next run (so a
+duplicate can't slip in). Answers are cached in `sync-state.json` for `CacheHours` (14 days) and
+reused as long as the question is exactly the same; any change to the device or candidates asks
+again. Every question, raw answer and decision is written to `logs\ai-YYYYMMDD.jsonl` (kept
+`LogRetentionDays`). The endpoint must be on this computer unless `AllowRemoteEndpoint` is true,
+so device and customer names don't leave the machine.
+
+Model confidence numbers are not well calibrated. Run report-only (or `-DryRun -UseLocalModel`)
+for a while and read `sync-preview.json` > `localModel.decisions` before trusting auto-links;
+set `AutoLink` to false to hold every suggestion for review. `gemma4:12b` is the default; the 31b
+model is slower but usually better at this. Change `Model` and nothing else.
 
 ## No duplicates
 
@@ -119,6 +170,9 @@ configurations are linked to an RMM or PSA integration (`rmm-integration-type`,
   changed and it's reported. `-RetireLimit N` allows more for one run.
 - The only IT Glue writes are `POST /configurations` and `PATCH /configurations/{id}`. Creates are
   not retried after a timeout, so a configuration can't be created twice. No redirects followed.
+- The local AI model (optional) only suggests. It never creates, archives or deletes anything,
+  its answers are checked, and only a high-confidence match to one of the candidates the script
+  sent is used. See "Optional: local AI model".
 - N-central is only read (plus the token sign-in). Paging is checked, so a partial read can't make
   devices look "gone".
 
@@ -131,11 +185,12 @@ configurations are linked to an RMM or PSA integration (`rmm-integration-type`,
 | `NCentralITGlueDeviceSync.config.example.json` | Example settings. Copy to `NCentralITGlueDeviceSync.config.json`. |
 
 Data folder (default `C:\ProgramData\NCentralITGlueDeviceSync`): `logs\sync-yyyyMMdd.log`,
-`state.json` (alert state), `sync-state.json` (device links and hardware cache),
+`logs\ai-yyyyMMdd.jsonl` (local AI model questions, answers and decisions, only when it's on),
+`state.json` (alert state), `sync-state.json` (device links, hardware cache, cached AI answers),
 `sync-preview.json` (last plan), `current-failures.csv` (attached to alerts),
 `ncentral-asset-sample.json` (one raw hardware-details reply, to check field names), `secrets.json`, `sync.lock`.
 
-Exit codes: 0 all matched, 1 devices skipped because of a problem, 2 couldn't run,
+Exit codes: 0 all matched, 1 devices skipped because of a problem (including local AI suggestions waiting for a person), 2 couldn't run,
 3 alert couldn't be sent, 4 IT Glue refused a change or the retire limit was hit.
 
 ## Setup
