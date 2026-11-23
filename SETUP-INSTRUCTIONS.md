@@ -4,7 +4,7 @@ Step-by-step guide to installing and configuring the N-central to IT Glue device
 sync computer. You don't need to know anything about the script beforehand. Do the parts in order
 and don't skip the tests.
 
-> **Status:** version 0.7. The script has **not been fully tested against live N-central and
+> **Status:** version 0.8. The script has **not been fully tested against live N-central and
 > IT Glue yet.** That is why setup goes through a dry run, then a one-device test, then a
 > report-only task, before it is allowed to change anything.
 
@@ -583,6 +583,7 @@ Shown at the end of every run (`Finished with exit code N`) and as `LastTaskResu
 | `Ollama isn't answering at http://localhost:11434` | Ollama isn't running for the task (nobody logged in), or the app was closed | Part 10.3, step 1 |
 | `Ollama ... doesn't have the model 'X'` | The model name in the config doesn't match `ollama list` | `ollama pull X`, or copy the exact name from `ollama list` |
 | `LocalModel.Endpoint ... is not on this computer` | Endpoint points at another machine | Use `http://localhost:11434`, or set `AllowRemoteEndpoint` if that's really intended |
+| A run is slow | Read the `Time:` and `Time per step:` lines at the end of the log | Compare with a run without the model: `.\Invoke-NCentralITGlueDeviceSync.ps1 -DryRun` (no `-UseLocalModel`, and `LocalModel.Enabled` false). If the local AI takes the time: the first run is the slowest (later runs reuse answers); lower `MaxCallsPerRun` / `MaxMinutesPerRun`, set `SuggestArchive` false, use the 12b model, or set `Think` false if the log says the model is thinking. If N-central takes the time: that's the hardware details for new devices, and it drops once they're cached |
 | `Ollama stopped answering during the run (... timed out)` | The model is slow or still loading | Raise `LocalModel.TimeoutSec`, or use the smaller model |
 | Devices listed under `creates` that already exist in IT Glue | Serial or name differs between the two systems | Don't apply. Fix the record by hand or report it |
 | `waiting for hardware details` doesn't go down | Only 300 devices are read per run | Let the report-only task run a few times, or raise `NCentral.MaxAssetLookupsPerRun` for one run |

@@ -50,7 +50,7 @@
   },
 
   "LocalModel": {
-    "_comment": "Optional local AI model in Ollama (off unless Enabled is true or the script is run with -UseLocalModel). It only suggests matches for devices the serial number and name checks couldn't match, and IT Glue configurations that look retired. AutoLink true + confidence >= AutoLinkConfidence = linked; >= ReviewConfidence = held and reported for a person; lower = treated as no match. Endpoint must be on this computer unless AllowRemoteEndpoint is true. ApprovedMatches / RejectedMatches: {\"N-central device id\": \"IT Glue configuration id\"}, copied from the alert. KeepConfigurationIds: IT Glue ids never to suggest archiving.",
+    "_comment": "Optional local AI model in Ollama (off unless Enabled is true or the script is run with -UseLocalModel). It only suggests matches for devices the serial number and name checks couldn't match, and IT Glue configurations that look retired. AutoLink true + confidence >= AutoLinkConfidence = linked; >= ReviewConfidence = held and reported for a person; lower = treated as no match. Endpoint must be on this computer unless AllowRemoteEndpoint is true. ApprovedMatches / RejectedMatches: {\"N-central device id\": \"IT Glue configuration id\"}, copied from the alert. KeepConfigurationIds: IT Glue ids never to suggest archiving. Speed: MaxCallsPerRun / MaxArchiveCallsPerRun / MaxMinutesPerRun cap new questions per run (answers are cached); KeepAlive keeps the model loaded; Think false turns off a thinking model's slow reasoning (null = not sent).",
     "Enabled": false,
     "Endpoint": "http://localhost:11434",
     "Model": "gemma4:12b",
@@ -63,10 +63,12 @@
     "SuggestArchive": true,
     "TimeoutSec": 180,
     "MaxCallsPerRun": 100,
-    "MaxMinutesPerRun": 20,
+    "MaxArchiveCallsPerRun": 20,
+    "MaxMinutesPerRun": 10,
     "CacheHours": 336,
-    "ContextTokens": 8192,
-    "KeepAlive": "15m",
+    "ContextTokens": 4096,
+    "KeepAlive": "30m",
+    "Think": null,
     "ApprovedMatches": {},
     "RejectedMatches": {},
     "KeepConfigurationIds": []

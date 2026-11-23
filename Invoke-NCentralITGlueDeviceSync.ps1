@@ -134,7 +134,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.7'
+$ScriptVersion = '0.8'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -207,8 +207,8 @@ $Defaults = [ordered]@{
     LocalModel             = @{
         Enabled = $false; Endpoint = 'http://localhost:11434'; Model = 'gemma4:12b'; AllowRemoteEndpoint = $false
         AutoLink = $true; AutoLinkConfidence = 90; ReviewConfidence = 60; MinNameSimilarity = 0.3; MaxCandidates = 15
-        SuggestArchive = $true; TimeoutSec = 180; MaxCallsPerRun = 100; MaxMinutesPerRun = 20; CacheHours = 336
-        ContextTokens = 8192; KeepAlive = '15m'
+        SuggestArchive = $true; TimeoutSec = 180; MaxCallsPerRun = 100; MaxArchiveCallsPerRun = 20; MaxMinutesPerRun = 10; CacheHours = 336
+        ContextTokens = 4096; KeepAlive = '30m'; Think = $null
         ApprovedMatches = @{}; RejectedMatches = @{}; KeepConfigurationIds = @()
     }
     ReminderHours          = 24
@@ -523,7 +523,7 @@ $NcBase = ([string]$Cfg.NCentral.ServerUrl).Trim().TrimEnd('/')
 if ($NcBase -match '/api$') { $NcBase = $NcBase.Substring(0, $NcBase.Length - 4) }
 $script:NcHeaders = $null
 
-function Connect-NCentral {
+function Connect-NCentralCore {
     $u = $null
     if (-not [Uri]::TryCreate($NcBase, [UriKind]::Absolute, [ref]$u) -or $u.Scheme -ne 'https' -or $u.AbsolutePath -ne '/') {
         throw "NCentral.ServerUrl must be just the https address of your N-central server, e.g. https://ncentral.example.com (got '$NcBase')."
@@ -542,7 +542,7 @@ function Connect-NCentral {
     if (-not $tok) { throw 'N-central sign-in answered without an access token (tokens.access.token).' }
     $script:NcHeaders = @{ Authorization = "Bearer $tok"; Accept = 'application/json' }
 }
-function Invoke-NCentralGet {
+function Invoke-NCentralGetCore {
     param([string]$Path)
     $uri = "$NcBase$Path"
     if (-not $uri.StartsWith("$NcBase/api/", [StringComparison]::Ordinal)) { throw "Refusing to call $uri (not under $NcBase/api/)." }
@@ -565,6 +565,17 @@ function Invoke-NCentralGet {
             throw "N-central GET $Path failed (HTTP $status): $(Get-HttpErrorText $_)"
         }
     }
+}
+# Timing: every call to N-central, IT Glue and the local model is counted for the summary at the end.
+$script:Timing = @{ NcMs = 0; NcCalls = 0; ItgMs = 0; ItgCalls = 0; AiMs = 0; AiCalls = 0 }
+function Connect-NCentral {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try { Connect-NCentralCore } finally { $script:Timing.NcMs += $sw.ElapsedMilliseconds; $script:Timing.NcCalls++ }
+}
+function Invoke-NCentralGet {
+    param([string]$Path)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try { return (Invoke-NCentralGetCore -Path $Path) } finally { $script:Timing.NcMs += $sw.ElapsedMilliseconds; $script:Timing.NcCalls++ }
 }
 # Reads every page and rejects duplicates and short reads, so a partial read can't make
 # devices look "removed from N-central".
@@ -654,7 +665,7 @@ function Get-AssetDetails {
 $BaseUrl = ([string]$Cfg.ITGlueBaseUrl).Trim().TrimEnd('/')
 $AllowedUrls = @('https://api.itglue.com', 'https://api.eu.itglue.com', 'https://api.au.itglue.com')
 
-function Invoke-ITGlueGet {
+function Invoke-ITGlueGetCore {
     param([string]$Uri)
     if (-not $Uri.StartsWith("$BaseUrl/", [StringComparison]::Ordinal)) { throw "Refusing to call $Uri (not under $BaseUrl)." }
     $attempt = 0
@@ -676,6 +687,16 @@ function Invoke-ITGlueGet {
             throw
         }
     }
+}
+function Invoke-ITGlueGet {
+    param([string]$Uri)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try { return (Invoke-ITGlueGetCore -Uri $Uri) } finally { $script:Timing.ItgMs += $sw.ElapsedMilliseconds; $script:Timing.ItgCalls++ }
+}
+function Invoke-ITGlueWrite {
+    param([string]$Method, [string]$Path, [hashtable]$Attributes)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try { return (Invoke-ITGlueWriteCore -Method $Method -Path $Path -Attributes $Attributes) } finally { $script:Timing.ItgMs += $sw.ElapsedMilliseconds; $script:Timing.ItgCalls++ }
 }
 function Get-ITGlueAll {
     param([string]$Path)
@@ -714,7 +735,7 @@ function Get-ITGlueAll {
 }
 # The only writes this script makes. POST is not retried after a timeout or 5xx, so a
 # configuration can't be created twice; it is reported and the next run matches it by serial.
-function Invoke-ITGlueWrite {
+function Invoke-ITGlueWriteCore {
     param([ValidateSet('POST', 'PATCH')][string]$Method, [string]$Path, [hashtable]$Attributes)
     if ($Method -eq 'POST' -and $Path -ne '/configurations') { throw "Refusing to POST to $Path." }
     if ($Method -eq 'PATCH' -and $Path -notmatch '^/configurations/\d+$') { throw "Refusing to PATCH $Path." }
@@ -835,6 +856,7 @@ $AiPromptVersion = 'v1'   # change when the prompts change, so cached answers ar
 $script:AiReady = $false; $script:AiDown = ''; $script:AiCalls = 0; $script:AiBadInRow = 0
 $script:AiClock = $null   # started at the first question, so MaxMinutesPerRun counts model time only
 $script:AiUsedKeys = @{}
+$script:AiCallsByKind = @{}
 
 $AiMatchSystem = @'
 You help keep IT documentation (IT Glue) in step with an RMM tool (N-central). N-central is the source of truth for devices.
@@ -875,8 +897,48 @@ $AiArchiveSchema = @{
 }
 
 # 0..1, how alike two device names are (letters and digits only, case ignored; Levenshtein).
+# Compiled once (C#, about a second) because PowerShell loops are slow for thousands of pairs;
+# falls back to the PowerShell version below if compiling isn't allowed.
+$script:FastSim = $false
+function Initialize-FastSimilarity {
+    if ('NcItgText' -as [type]) { $script:FastSim = $true; return }
+    try {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
+public static class NcItgText {
+    static string Clean(string s) {
+        if (s == null) return "";
+        var sb = new System.Text.StringBuilder(s.Length);
+        foreach (char ch in s.ToLowerInvariant()) { if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) sb.Append(ch); }
+        return sb.ToString();
+    }
+    public static double Similarity(string first, string second) {
+        string x = Clean(first), y = Clean(second);
+        if (x.Length == 0 || y.Length == 0) return 0.0;
+        if (x == y) return 1.0;
+        int n = x.Length, m = y.Length;
+        int[] prev = new int[m + 1], cur = new int[m + 1];
+        for (int j = 0; j <= m; j++) prev[j] = j;
+        for (int i = 1; i <= n; i++) {
+            cur[0] = i;
+            for (int j = 1; j <= m; j++) {
+                int cost = x[i - 1] == y[j - 1] ? 0 : 1;
+                int v = prev[j] + 1;
+                if (cur[j - 1] + 1 < v) v = cur[j - 1] + 1;
+                if (prev[j - 1] + cost < v) v = prev[j - 1] + cost;
+                cur[j] = v;
+            }
+            int[] t = prev; prev = cur; cur = t;
+        }
+        return 1.0 - ((double)prev[m] / System.Math.Max(n, m));
+    }
+}
+'@
+        $script:FastSim = $true
+    } catch { Write-Log "Couldn't compile the fast name comparison, using the slower PowerShell one: $($_.Exception.Message)" 'WARN' }
+}
 function Get-NameSimilarity {
     param([string]$First, [string]$Second)
+    if ($script:FastSim) { return [NcItgText]::Similarity($First, $Second) }
     $x = ([string]$First).ToLowerInvariant() -replace '[^a-z0-9]', ''
     $y = ([string]$Second).ToLowerInvariant() -replace '[^a-z0-9]', ''
     if (-not $x -or -not $y) { return 0.0 }
@@ -924,6 +986,7 @@ function Test-LocalModel {
         return
     }
     $script:AiReady = $true
+    Initialize-FastSimilarity
     Write-Log "Local AI model '$want' is available at $LmBase."
 }
 function Invoke-LocalModel {
@@ -933,11 +996,25 @@ function Invoke-LocalModel {
         options = @{ temperature = 0; seed = 7; num_ctx = [int]$Lm.ContextTokens }
         messages = @(@{ role = 'system'; content = $System }, @{ role = 'user'; content = $Prompt })
     }
-    if ($Lm.KeepAlive) { $body['keep_alive'] = [string]$Lm.KeepAlive }
+    if ($Lm.KeepAlive) { $body['keep_alive'] = [string]$Lm.KeepAlive }   # keeps the model loaded between questions
+    $think = $Lm.Think
+    if ($think -is [string]) { if ($think -match '^(true|yes|1)$') { $think = $true } elseif ($think -match '^(false|no|0)$') { $think = $false } else { $think = $null } }
+    if ($think -is [bool]) { $body['think'] = $think }   # only sent when set: a "thinking" model is much slower
     $json = ConvertTo-Json -InputObject $body -Depth 10 -Compress
     $r = Invoke-RestMethod -Method POST -Uri "$LmBase/api/chat" -Body ([Text.Encoding]::UTF8.GetBytes($json)) -ContentType 'application/json; charset=utf-8' -TimeoutSec ([int]$Lm.TimeoutSec) -MaximumRedirection 0
     if (-not $r -or -not $r.message) { throw 'Ollama answered without a message.' }
-    return [string]$r.message.content
+    return $r
+}
+$script:AiThinkWarned = $false
+# "load 3.1s, read 0.9s, answer 4.2s, 61 tokens" from Ollama's own timings (nanoseconds).
+function Get-OllamaTimingText {
+    param($R)
+    $parts = @()
+    foreach ($p in @(@('load_duration', 'model load'), @('prompt_eval_duration', 'reading the question'), @('eval_duration', 'writing the answer'))) {
+        $v = $R.($p[0]); if ($v) { $parts += ('{0} {1:N1}s' -f $p[1], ([double]$v / 1e9)) }
+    }
+    if ($R.eval_count) { $parts += "$($R.eval_count) tokens" }
+    return ($parts -join ', ')
 }
 function ConvertFrom-ModelJson {
     param([string]$Text)
@@ -958,7 +1035,7 @@ function ConvertTo-Confidence {
 # Returns @{ status = ok|deferred|error; answer; cached; why }. $Validate turns the parsed JSON into
 # a checked answer hashtable or throws (it gets the parsed JSON and $Context); only checked answers are cached.
 function Get-AiAnswer {
-    param([string]$Kind, [string]$Subject, [string]$System, [string]$Prompt, [hashtable]$Schema, [scriptblock]$Validate, $Context)
+    param([string]$Kind, [string]$Subject, [string]$System, [string]$Prompt, [hashtable]$Schema, [scriptblock]$Validate, $Context, [int]$MaxNewCalls = -1)
     $key = Get-TextHash "$AiPromptVersion|$($Lm.Model)|$Kind|$System|$Prompt"
     $script:AiUsedKeys[$key] = $true
     $hit = $Sync.ai[$key]
@@ -968,11 +1045,21 @@ function Get-AiAnswer {
     }
     if ($script:AiDown) { return @{ status = 'error'; why = $script:AiDown } }
     if (-not $script:AiClock) { $script:AiClock = [Diagnostics.Stopwatch]::StartNew() }
+    if ($MaxNewCalls -ge 0 -and [int]$script:AiCallsByKind[$Kind] -ge $MaxNewCalls) { return @{ status = 'deferred' } }
     if ($script:AiCalls -ge [int]$Lm.MaxCallsPerRun -or $script:AiClock.Elapsed.TotalMinutes -ge [double]$Lm.MaxMinutesPerRun) { return @{ status = 'deferred' } }
     $script:AiCalls++
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $raw = ''; $answer = $null; $err = ''
-    try { $raw = Invoke-LocalModel -System $System -Prompt $Prompt -Schema $Schema }
+    $raw = ''; $answer = $null; $err = ''; $tm = ''
+    try {
+        $resp = Invoke-LocalModel -System $System -Prompt $Prompt -Schema $Schema
+        $raw = [string]$resp.message.content
+        $tm = Get-OllamaTimingText $resp
+        $thought = [string]$resp.message.thinking
+        if ($thought -and -not $script:AiThinkWarned) {
+            $script:AiThinkWarned = $true
+            Write-Log "The model writes $($thought.Length) characters of 'thinking' before each answer, which makes it much slower. To turn that off, set LocalModel.Think to false in the config." 'WARN'
+        }
+    }
     catch {
         $err = "Ollama call failed: $($_.Exception.Message)"
         $script:AiDown = "Ollama stopped answering during the run ($($_.Exception.Message)). If this is a timeout, raise LocalModel.TimeoutSec or use a smaller model."
@@ -986,7 +1073,10 @@ function Get-AiAnswer {
         }
     }
     $sw.Stop()
-    Write-AiAudit @{ type = 'call'; kind = $Kind; subject = $Subject; model = [string]$Lm.Model; key = $key; system = $System; prompt = $Prompt; raw = $raw; answer = $answer; error = $err; ms = $sw.ElapsedMilliseconds }
+    $script:Timing.AiMs += $sw.ElapsedMilliseconds; $script:Timing.AiCalls++
+    if ($Kind) { $script:AiCallsByKind[$Kind] = 1 + [int]$script:AiCallsByKind[$Kind] }
+    Write-Log ("Local AI ({0}) {1}: {2:N1}s{3}{4}" -f $Kind, $Subject, ($sw.ElapsedMilliseconds / 1000.0), $(if ($tm) { " ($tm)" }), $(if ($err) { " - $err" }))
+    Write-AiAudit @{ type = 'call'; timing = $tm; kind = $Kind; subject = $Subject; model = [string]$Lm.Model; key = $key; system = $System; prompt = $Prompt; raw = $raw; answer = $answer; error = $err; ms = $sw.ElapsedMilliseconds }
     if ($err) { return @{ status = 'error'; why = $err } }
     $Sync.ai[$key] = @{ askedUtc = Get-UtcText; kind = $Kind; answer = $answer }
     return @{ status = 'ok'; answer = $answer; cached = $false; key = $key }
@@ -1010,6 +1100,10 @@ function Get-ConfFacts {
 # The sync
 # =====================================================================================
 function Invoke-DeviceSync {
+    $runClock = [Diagnostics.Stopwatch]::StartNew()
+    $phaseClock = [Diagnostics.Stopwatch]::StartNew()
+    $phaseTimes = New-Object System.Collections.ArrayList
+    $markPhase = { param([string]$Name) $sec = $phaseClock.Elapsed.TotalSeconds; $null = $phaseTimes.Add(('{0} {1:N0}s' -f $Name, $sec)); Write-Log ('Took {0:N1}s: {1}' -f $sec, $Name); $phaseClock.Restart() }
     $stats = [ordered]@{ ncDevices = 0; considered = 0; skippedClass = 0; skippedExcluded = 0; skippedStale = 0; skippedProbe = 0; customerMismatch = 0; siteMismatch = 0; conflicts = 0; waitingForDetails = 0; inSync = 0; toCreate = 0; toUpdate = 0; created = 0; updated = 0; writeFailed = 0; deferred = 0; removed = 0; retired = 0
         aiAsked = 0; aiCached = 0; aiLinked = 0; aiReview = 0; aiNoMatch = 0; aiNotAsked = 0; aiArchive = 0; aiDeferred = 0; aiErrors = 0 }
 
@@ -1042,6 +1136,7 @@ function Invoke-DeviceSync {
         Write-Log "N-central: $($orgUnits.Count) org units (some devices had no customer name)."
     }
 
+    & $markPhase 'reading N-central'
     # ---------- 2. Read IT Glue ----------
     Write-Log "Reading IT Glue at $BaseUrl ..."
     $orgs = Get-ITGlueAll '/organizations'
@@ -1140,6 +1235,7 @@ function Invoke-DeviceSync {
         if ($lk -is [hashtable] -and $lk.itg) { $linkedConf[[string]$lk.itg] = $nid }
     }
 
+    & $markPhase 'reading IT Glue'
     # ---------- 3. Match each device to a customer and site ----------
     $ncById = @{}
     $candidates = New-Object System.Collections.ArrayList
@@ -1251,6 +1347,7 @@ function Invoke-DeviceSync {
         Write-Log "Hardware details fetched for $assetFetches device(s) this run (cache keeps them $refreshH h; at most $maxFetch per run)."
     }
 
+    & $markPhase 'customer/site matching and hardware details'
     # ---------- 5. Duplicate serial numbers inside N-central: newest check-in wins ----------
     $bySerial = @{}
     foreach ($c in $candidates) {
@@ -1458,6 +1555,7 @@ function Invoke-DeviceSync {
     }
 
 
+    & $markPhase 'matching devices to IT Glue configurations'
     # ---------- 6b. Optional: ask the local AI model about devices with no serial/name match ----------
     # One device at a time, with a short list of non-archived IT Glue configurations at the same
     # customer that aren't already taken. The script checks the answer and decides.
@@ -1546,6 +1644,7 @@ function Invoke-DeviceSync {
         Write-AiAudit @{ type = 'decision'; kind = 'match'; action = $action; ncId = $c.Id; device = $c.Name; customer = $c.CustName; itgId = $mid; confidence = $cf; reason = [string]$ans.reason; cached = [bool]$r.cached; key = $r.key; apply = [bool]$Apply }
     }
 
+    & $markPhase 'local AI matching'
     # ---------- 6c. Optional: IT Glue configurations the local AI model thinks are retired ----------
     # Only for customers whose devices were all matched this run, only for configuration types
     # this sync manages, and only records no N-central device is linked to or named like. The
@@ -1586,7 +1685,7 @@ function Invoke-DeviceSync {
                     if ($null -eq $arch) { throw "archive '$($o.archive)' is not true or false" }
                     return @{ archive = $arch; confidence = (ConvertTo-Confidence $o.confidence); reason = (Get-ShortText $o.reason 300) }
                 }
-                $r = Get-AiAnswer -Kind 'archive' -Subject "IT Glue $xid $(Get-Attr $x 'name')" -System $AiArchiveSystem -Prompt $prompt -Schema $AiArchiveSchema -Validate $validate -Context $null
+                $r = Get-AiAnswer -Kind 'archive' -Subject "IT Glue $xid $(Get-Attr $x 'name')" -System $AiArchiveSystem -Prompt $prompt -Schema $AiArchiveSchema -Validate $validate -Context $null -MaxNewCalls ([int]$Lm.MaxArchiveCallsPerRun)
                 if ($r.status -eq 'deferred') { $stats.aiDeferred++; continue }
                 if ($r.status -ne 'ok') { $stats.aiErrors++; continue }
                 if ($r.cached) { $stats.aiCached++ } else { $stats.aiAsked++ }
@@ -1611,6 +1710,7 @@ function Invoke-DeviceSync {
         Write-Log ("Local AI: {0} asked, {1} answers reused, {2} linked, {3} held for review, {4} no match, {5} not asked (no similar names), {6} archive suggestions, {7} left for the next run, {8} errors." -f $stats.aiAsked, $stats.aiCached, $stats.aiLinked, $stats.aiReview, $stats.aiNoMatch, $stats.aiNotAsked, $stats.aiArchive, $stats.aiDeferred, $stats.aiErrors)
     }
 
+    & $markPhase 'local AI archive suggestions'
     # ---------- 7. Devices synced before that are no longer in N-central ----------
     $retire = New-Object System.Collections.ArrayList
     if (-not $Limited) {
@@ -1650,6 +1750,7 @@ function Invoke-DeviceSync {
     } catch { Write-Log "Couldn't write $PreviewPath : $($_.Exception.Message)" 'WARN' }
     Write-Log ("Plan: {0} to create, {1} to update, {2} already match, {3} new devices waiting for hardware details, {4} conflicts, {5} removed from N-central, {6} held for a local AI check or review. Details: {7}" -f $stats.toCreate, $stats.toUpdate, $stats.inSync, $stats.waitingForDetails, $stats.conflicts, $stats.removed, ($stats.aiReview + $stats.aiDeferred), $PreviewPath)
 
+    & $markPhase 'removed devices and preview'
     # ---------- 9. Apply ----------
     $writeFailures = 0
     if (-not $Apply) {
@@ -1714,6 +1815,14 @@ function Invoke-DeviceSync {
     if ($retire.Count -gt 0 -and -not $Apply -and -not $retireBlocked) {
         foreach ($r in $retire) { Write-Log "WOULD SET '$($Cfg.Sync.RetiredStatus)' $(Get-Attr $r.conf 'organization-name') | $(Get-Attr $r.conf 'name') (N-central device $($r.ncId) is gone)" }
     }
+    & $markPhase $(if ($Apply) { 'making changes in IT Glue' } else { 'listing planned changes' })
+    $T = $script:Timing
+    $total = $runClock.Elapsed.TotalSeconds
+    $other = [math]::Max(0, $total - ($T.NcMs + $T.ItgMs + $T.AiMs) / 1000.0)
+    $aiPart = ''
+    if ($T.AiCalls -gt 0) { $aiPart = (', local AI {0:N0}s ({1} questions, {2:N1}s each)' -f ($T.AiMs / 1000.0), $T.AiCalls, ($T.AiMs / 1000.0 / $T.AiCalls)) }
+    Write-Log ('Time: {0:N0}s in total. N-central {1:N0}s ({2} calls), IT Glue {3:N0}s ({4} calls){5}, everything else {6:N0}s (waits between calls, comparing names, building the plan).' -f $total, ($T.NcMs / 1000.0), $T.NcCalls, ($T.ItgMs / 1000.0), $T.ItgCalls, $aiPart, $other)
+    Write-Log "Time per step: $($phaseTimes -join '; ')"
     return @{ Stats = $stats; WriteFailures = $writeFailures; RetireBlocked = $retireBlocked }
 }
 

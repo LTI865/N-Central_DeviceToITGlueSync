@@ -12,7 +12,7 @@ sites and contacts, so this script **never creates, renames or changes an IT Glu
 or location**. It only creates and updates IT Glue Configurations, and it never deletes or
 archives anything.
 
-> **Status: v0.7, not yet tested against live N-central or IT Glue.** The N-central field names
+> **Status: v0.8, not yet tested against live N-central or IT Glue.** The N-central field names
 > (especially the hardware details from `/api/devices/{id}/assets`) are based on N-able's API
 > documentation and need checking on the first dry run. Follow "First run" below. The optional
 > local AI model mode (v0.4) has not been run against Ollama yet either.
@@ -124,6 +124,16 @@ again. Every question, raw answer and decision is written to `logs\ai-YYYYMMDD.j
 `LogRetentionDays`). The endpoint must be on this computer unless `AllowRemoteEndpoint` is true,
 so device and customer names don't leave the machine.
 
+**Speed.** Each new question takes from a few seconds to a minute, depending on the model and
+the PC (the 31b model is several times slower than 12b). The first run with the model on is the
+slowest, because nothing is cached yet; later runs only ask about new or changed devices. Per run
+the model gets at most `MaxCallsPerRun` (100) new questions, of which at most
+`MaxArchiveCallsPerRun` (20) are archive suggestions, and at most `MaxMinutesPerRun` (10) minutes;
+the rest wait for the next run. `KeepAlive` (30m) keeps the model loaded between questions;
+`ContextTokens` (4096) is enough for these prompts. If the log warns that the model is
+"thinking", set `Think` to false. Every question is logged with its time
+(`Local AI (match) ...: 8.4s (model load ..., reading the question ..., writing the answer ...)`).
+
 Model confidence numbers are not well calibrated. Run report-only (or `-DryRun -UseLocalModel`)
 for a while and read `sync-preview.json` > `localModel.decisions` before trusting auto-links;
 set `AutoLink` to false to hold every suggestion for review. `gemma4:12b` is the default; the 31b
@@ -195,6 +205,11 @@ Data folder (default `C:\ProgramData\NCentralITGlueDeviceSync`): `logs\sync-yyyy
 `state.json` (alert state), `sync-state.json` (device links, hardware cache, cached AI answers),
 `sync-preview.json` (last plan), `current-failures.csv` (attached to alerts),
 `ncentral-asset-sample.json` (one raw hardware-details reply, to check field names), `secrets.json`, `sync.lock`.
+
+Timing: every run ends with `Time: ...s in total. N-central ...s (N calls), IT Glue ...s (N calls),
+local AI ...s (...), everything else ...s` and a `Time per step:` line, so you can see where a slow
+run spent its time. Reading hardware details from N-central (up to `MaxAssetLookupsPerRun`, 300,
+one call per device, cached for 24 hours) is usually the slow part of a run without the model.
 
 Exit codes: 0 all matched, 1 devices skipped because of a problem (including local AI suggestions waiting for a person), 2 couldn't run,
 3 alert couldn't be sent, 4 IT Glue refused a change or the retire limit was hit.
