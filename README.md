@@ -12,7 +12,7 @@ sites and contacts, so this script **never creates, renames or changes an IT Glu
 or location**. It only creates and updates IT Glue Configurations, and it never deletes or
 archives anything.
 
-> **Status: v0.8, not yet tested against live N-central or IT Glue.** The N-central field names
+> **Status: v0.9, not yet tested against live N-central or IT Glue.** The N-central field names
 > (especially the hardware details from `/api/devices/{id}/assets`) are based on N-able's API
 > documentation and need checking on the first dry run. Follow "First run" below. The optional
 > local AI model mode (v0.4) has not been run against Ollama yet either.
@@ -90,9 +90,27 @@ the same computer (default `http://localhost:11434`) with the model pulled (defa
 `gemma4:12b`). The script talks to Ollama's API directly; OpenCode isn't involved.
 
 **The script decides, the model only suggests.** Exact matching (link, serial, name) always runs
-first. Only the devices still unmatched go to the model, **one device at a time**, with up to
-`MaxCandidates` (15) **non-archived** IT Glue configurations from the **same organization and
-location** (configurations with no location are included too). The
+first. Only the devices still unmatched go to the model.
+
+**Batch mode (`Mode: "Batch"`, the default since v0.9):** one question per customer instead of
+one per device. The script writes the customer's leftover devices and the candidate IT Glue
+records to CSV files, sends both tables in one question (up to `BatchSize`, 25, devices per
+question; bigger customers are split, and a question too long for `MaxContextTokens` is split
+again), and gets back a table: device, record id or none, confidence, reason. Each device brings
+its `BatchCandidatesPerDevice` (5) most similar records. Every row is checked: the record must be
+one the script allowed for **that** device (same customer, same location or none, not taken,
+serials don't disagree); a bad or missing row counts as "no answer" for that device only, and if
+more than half the rows are bad the whole answer is thrown away. If the model gives one record to
+two devices, both are held for review. The files are kept as an audit trail in
+`C:\ProgramData\NCentralITGlueDeviceSync\ai-batches\<date>-<run>\`: per customer
+`<id>-<name>-devices.csv`, `-configs.csv` and `-results.csv` (what the model said and what the
+script did), deleted after `LogRetentionDays`.
+
+**Per-device mode (`Mode: "PerDevice"`):** the v0.4 behavior: one question per device with up to
+`MaxCandidates` (15) records. Slower, but simpler questions for a small model.
+
+In both modes the candidates are **non-archived** IT Glue configurations from the **same
+organization and location** (configurations with no location are included too). The
 candidates are pre-filtered by the script: not already linked to another device that is in
 N-central, not matched to another device this run, no serial number that disagrees, and ranked by
 how alike the names are (and a matching MAC address). If no candidate's name is at least
@@ -124,7 +142,8 @@ again. Every question, raw answer and decision is written to `logs\ai-YYYYMMDD.j
 `LogRetentionDays`). The endpoint must be on this computer unless `AllowRemoteEndpoint` is true,
 so device and customer names don't leave the machine.
 
-**Speed.** Each new question takes from a few seconds to a minute, depending on the model and
+**Speed.** Batch mode asks far fewer questions (one per 25 devices instead of one per device),
+though each one takes longer. Each new question takes from a few seconds to a minute, depending on the model and
 the PC (the 31b model is several times slower than 12b). The first run with the model on is the
 slowest, because nothing is cached yet; later runs only ask about new or changed devices. Per run
 the model gets at most `MaxCallsPerRun` (100) new questions, of which at most

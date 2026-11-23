@@ -50,8 +50,12 @@
   },
 
   "LocalModel": {
-    "_comment": "Optional local AI model in Ollama (off unless Enabled is true or the script is run with -UseLocalModel). It only suggests matches for devices the serial number and name checks couldn't match, and IT Glue configurations that look retired. AutoLink true + confidence >= AutoLinkConfidence = linked; >= ReviewConfidence = held and reported for a person; lower = treated as no match. Endpoint must be on this computer unless AllowRemoteEndpoint is true. ApprovedMatches / RejectedMatches: {\"N-central device id\": \"IT Glue configuration id\"}, copied from the alert. KeepConfigurationIds: IT Glue ids never to suggest archiving. Speed: MaxCallsPerRun / MaxArchiveCallsPerRun / MaxMinutesPerRun cap new questions per run (answers are cached); KeepAlive keeps the model loaded; Think false turns off a thinking model's slow reasoning (null = not sent).",
+    "_comment": "Optional local AI model in Ollama (off unless Enabled is true or the script is run with -UseLocalModel). Mode Batch (default) = one question per customer, up to BatchSize devices each, with the BatchCandidatesPerDevice most similar IT Glue records per device; PerDevice = one question per device (MaxCandidates records). It only suggests matches for devices the serial number and name checks couldn't match, and IT Glue configurations that look retired. AutoLink true + confidence >= AutoLinkConfidence = linked; >= ReviewConfidence = held and reported for a person; lower = treated as no match. Endpoint must be on this computer unless AllowRemoteEndpoint is true. ApprovedMatches / RejectedMatches: {\"N-central device id\": \"IT Glue configuration id\"}, copied from the alert. KeepConfigurationIds: IT Glue ids never to suggest archiving. Speed: MaxCallsPerRun / MaxArchiveCallsPerRun / MaxMinutesPerRun cap new questions per run (answers are cached); KeepAlive keeps the model loaded; Think false turns off a thinking model's slow reasoning (null = not sent).",
     "Enabled": false,
+    "Mode": "Batch",
+    "BatchSize": 25,
+    "BatchCandidatesPerDevice": 5,
+    "MaxContextTokens": 32768,
     "Endpoint": "http://localhost:11434",
     "Model": "gemma4:12b",
     "AllowRemoteEndpoint": false,

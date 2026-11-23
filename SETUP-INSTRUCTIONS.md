@@ -4,7 +4,7 @@ Step-by-step guide to installing and configuring the N-central to IT Glue device
 sync computer. You don't need to know anything about the script beforehand. Do the parts in order
 and don't skip the tests.
 
-> **Status:** version 0.8. The script has **not been fully tested against live N-central and
+> **Status:** version 0.9. The script has **not been fully tested against live N-central and
 > IT Glue yet.** That is why setup goes through a dry run, then a one-device test, then a
 > report-only task, before it is allowed to change anything.
 
@@ -452,6 +452,9 @@ summary near the end. The first question can take a minute while the model loads
   line per device or record, with the action (`link`, `review`, `none`, `suggest-archive`,
   `keep`), confidence and reason.
 - `logs\ai-YYYYMMDD.jsonl`: the exact question and raw answer for each.
+- `ai-batches\<date>-<run>\`: per customer, the devices and IT Glue records that were sent (as
+  CSV) and `-results.csv` with the model's answer and what the script did with each device.
+  (Batch mode, the default. Set `"Mode": "PerDevice"` for one question per device instead.)
 
 If a `link` decision is wrong, the model is too confident for automatic links: set
 `"AutoLink": false` (everything is held for you to check) or raise `AutoLinkConfidence`. If it

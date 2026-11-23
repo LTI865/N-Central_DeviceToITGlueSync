@@ -134,7 +134,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.8'
+$ScriptVersion = '0.9'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -205,7 +205,7 @@ $Defaults = [ordered]@{
         DelayMsBetweenWrites = 250
     }
     LocalModel             = @{
-        Enabled = $false; Endpoint = 'http://localhost:11434'; Model = 'gemma4:12b'; AllowRemoteEndpoint = $false
+        Enabled = $false; Mode = 'Batch'; BatchSize = 25; BatchCandidatesPerDevice = 5; MaxContextTokens = 32768; Endpoint = 'http://localhost:11434'; Model = 'gemma4:12b'; AllowRemoteEndpoint = $false
         AutoLink = $true; AutoLinkConfidence = 90; ReviewConfidence = 60; MinNameSimilarity = 0.3; MaxCandidates = 15
         SuggestArchive = $true; TimeoutSec = 180; MaxCallsPerRun = 100; MaxArchiveCallsPerRun = 20; MaxMinutesPerRun = 10; CacheHours = 336
         ContextTokens = 4096; KeepAlive = '30m'; Think = $null
@@ -885,6 +885,37 @@ Nothing is archived automatically: a person reviews your answer.
 confidence is 0 to 100: how sure you are about your archive answer. reason is one short sentence a technician can check.
 Answer only with the JSON object.
 '@
+$AiBatchSystem = @'
+You help keep IT documentation (IT Glue) in step with an RMM tool (N-central) for ONE customer. N-central is the source of truth for devices.
+You get two CSV tables: N-central devices that have no IT Glue record yet, and existing IT Glue configurations at the same customer that no device is linked to.
+For EVERY device row, decide whether one of the configurations is the SAME physical device, only named or recorded differently
+(for example: the computer was renamed, a different naming style, hostname vs. display name, a typo, an added or missing prefix or suffix,
+or the IT Glue record has no serial number).
+Rules:
+- Only use config_id values from the configurations table. If no configuration is clearly the same device, set match_id to "".
+- A device can only be a configuration at the same location, or one whose location is empty.
+- A configuration is at most one device.
+- A different serial number means a different device. A matching serial number or MAC address is strong evidence.
+- Names that are only alike in a pattern (PC-01 vs PC-02, or two users' laptops) are NOT the same device.
+- Matching manufacturer, model and type support a match; a conflict weakens it.
+- confidence is 0 to 100: how sure you are that match_id is the same device. Use 0 when match_id is "".
+- reason is one short sentence a technician can check.
+Return one entry in matches for every device_id. Answer only with the JSON object.
+'@
+$AiBatchSchema = @{
+    type = 'object'
+    properties = @{
+        matches = @{
+            type = 'array'
+            items = @{
+                type = 'object'
+                properties = [ordered]@{ device_id = @{ type = 'string' }; match_id = @{ type = 'string' }; confidence = @{ type = 'integer'; minimum = 0; maximum = 100 }; reason = @{ type = 'string' } }
+                required = @('device_id', 'match_id', 'confidence', 'reason')
+            }
+        }
+    }
+    required = @('matches')
+}
 $AiMatchSchema = @{
     type = 'object'
     properties = [ordered]@{ match_id = @{ type = 'string' }; confidence = @{ type = 'integer'; minimum = 0; maximum = 100 }; reason = @{ type = 'string' } }
@@ -990,10 +1021,11 @@ function Test-LocalModel {
     Write-Log "Local AI model '$want' is available at $LmBase."
 }
 function Invoke-LocalModel {
-    param([string]$System, [string]$Prompt, [hashtable]$Schema)
+    param([string]$System, [string]$Prompt, [hashtable]$Schema, [int]$NumCtx = 0)
+    if ($NumCtx -lt 1) { $NumCtx = [int]$Lm.ContextTokens }
     $body = [ordered]@{
         model = [string]$Lm.Model; stream = $false; format = $Schema
-        options = @{ temperature = 0; seed = 7; num_ctx = [int]$Lm.ContextTokens }
+        options = @{ temperature = 0; seed = 7; num_ctx = $NumCtx }
         messages = @(@{ role = 'system'; content = $System }, @{ role = 'user'; content = $Prompt })
     }
     if ($Lm.KeepAlive) { $body['keep_alive'] = [string]$Lm.KeepAlive }   # keeps the model loaded between questions
@@ -1035,7 +1067,7 @@ function ConvertTo-Confidence {
 # Returns @{ status = ok|deferred|error; answer; cached; why }. $Validate turns the parsed JSON into
 # a checked answer hashtable or throws (it gets the parsed JSON and $Context); only checked answers are cached.
 function Get-AiAnswer {
-    param([string]$Kind, [string]$Subject, [string]$System, [string]$Prompt, [hashtable]$Schema, [scriptblock]$Validate, $Context, [int]$MaxNewCalls = -1)
+    param([string]$Kind, [string]$Subject, [string]$System, [string]$Prompt, [hashtable]$Schema, [scriptblock]$Validate, $Context, [int]$MaxNewCalls = -1, [int]$NumCtx = 0)
     $key = Get-TextHash "$AiPromptVersion|$($Lm.Model)|$Kind|$System|$Prompt"
     $script:AiUsedKeys[$key] = $true
     $hit = $Sync.ai[$key]
@@ -1051,7 +1083,7 @@ function Get-AiAnswer {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $raw = ''; $answer = $null; $err = ''; $tm = ''
     try {
-        $resp = Invoke-LocalModel -System $System -Prompt $Prompt -Schema $Schema
+        $resp = Invoke-LocalModel -System $System -Prompt $Prompt -Schema $Schema -NumCtx $NumCtx
         $raw = [string]$resp.message.content
         $tm = Get-OllamaTimingText $resp
         $thought = [string]$resp.message.thinking
@@ -1557,10 +1589,49 @@ function Invoke-DeviceSync {
 
     & $markPhase 'matching devices to IT Glue configurations'
     # ---------- 6b. Optional: ask the local AI model about devices with no serial/name match ----------
-    # One device at a time, with a short list of non-archived IT Glue configurations at the same
-    # customer that aren't already taken. The script checks the answer and decides.
+    # LocalModel.Mode "Batch" (default): one question per customer (chunks of BatchSize devices) with
+    # both lists as CSV. "PerDevice": one question per device. Either way the script builds the
+    # candidate lists (same customer, same location or none, not taken, serials don't disagree),
+    # checks every answer against them, and makes every decision.
     $aiDecisions = New-Object System.Collections.ArrayList
     $aiSuggested = @{}   # IT Glue configuration ids held for a person to check this run
+    $batchMode = ([string]$Lm.Mode -ne 'PerDevice')
+    $perDevTop = [math]::Max(1, [int]$Lm.MaxCandidates)
+    if ($batchMode) { $perDevTop = [math]::Max(1, [int]$Lm.BatchCandidatesPerDevice) }
+
+    # Applies one answer for one device. $note explains a forced hold.
+    $decide = {
+        param($c, $pick, [string]$mid, [int]$cf, [string]$reason, $r, [string]$note)
+        $action = 'none'
+        if ($pick -and $claimed.ContainsKey($mid) -and $claimed[$mid] -ne $c.Id) { $note = "IT Glue configuration $mid was also matched to N-central device $($claimed[$mid]) this run." }
+        if ($pick -and -not $note -and $Lm.AutoLink -eq $true -and $cf -ge [int]$Lm.AutoLinkConfidence) {
+            $action = 'link'; $stats.aiLinked++
+            Write-Log "Local AI: $($c.CustName) | $($c.Name) is IT Glue '$(Get-Attr $pick 'name')' (id $mid), confidence $cf. $reason"
+            $claimed[$mid] = $c.Id
+            $null = & $planDevice $c $pick 'ai'
+        } elseif ($pick -and ($note -or $cf -ge [int]$Lm.ReviewConfidence)) {
+            $action = 'review'; $stats.aiReview++; $aiSuggested[$mid] = $true; $orgsHeld[$c.OrgId] = $true
+            Add-Failure 'AiReview' "aimatch:$($c.Id)" $c.CustName $c.Name ("Not created or linked: possibly the same device as IT Glue configuration '{0}' (id {1}), confidence {2}. {3} {5}To accept, add `"{4}`": `"{1}`" to LocalModel.ApprovedMatches in the config. If it's a different device, add the same line to LocalModel.RejectedMatches." -f (Get-Attr $pick 'name'), $mid, $cf, $reason, $c.Id, $(if ($note) { "$note " } else { '' })) (Get-Attr $pick 'resource-url')
+        } else {
+            $stats.aiNoMatch++
+            $null = & $planDevice $c $null ''
+        }
+        if ($r.cached) { $stats.aiCached++ } else { $stats.aiAsked++ }
+        $null = $aiDecisions.Add([ordered]@{ kind = 'match'; action = $action; ncId = $c.Id; device = $c.Name; customer = $c.CustName; itgId = $mid; itgName = $(if ($pick) { Get-Attr $pick 'name' } else { '' }); confidence = $cf; reason = $reason; note = $note; cached = [bool]$r.cached })
+        Write-AiAudit @{ type = 'decision'; kind = 'match'; action = $action; ncId = $c.Id; device = $c.Name; customer = $c.CustName; itgId = $mid; confidence = $cf; reason = $reason; note = $note; cached = [bool]$r.cached; key = $r.key; apply = [bool]$Apply }
+        return $action
+    }
+    # A device the model couldn't answer for: held if a limit was hit, else the usual way.
+    $noAnswer = {
+        param($c, $r)
+        if ($r.status -eq 'deferred') { $stats.aiDeferred++; $orgsHeld[$c.OrgId] = $true; return }   # not created this run, so no duplicate can slip in
+        $stats.aiErrors++; $orgsHeld[$c.OrgId] = $true
+        Write-Log "Local AI couldn't check $($c.CustName) | $($c.Name), so it is matched without it: $($r.why)" 'WARN'
+        $null = & $planDevice $c $null ''
+    }
+
+    # Candidates for every queued device.
+    $aiItems = New-Object System.Collections.ArrayList
     foreach ($c in @($aiQueue | Sort-Object @{ Expression = { [string]$_.Id } })) {
         $a = $Sync.assets[$c.Id]; if ($a -isnot [hashtable]) { $a = @{} }
         $macKey = Get-MacKey ([string]$a.mac)
@@ -1584,64 +1655,141 @@ function Invoke-DeviceSync {
             $mm = [bool]($macKey -and (Get-MacKey (Get-Attr $x 'mac-address')) -eq $macKey)
             $null = $scored.Add(@{ Conf = $x; Sim = $sim; Mac = $mm; Score = ($sim + $(if ($mm) { 1 } else { 0 })) })
         }
-        $top = @($scored | Sort-Object @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { [int64]$_.Conf.id } } | Select-Object -First ([math]::Max(1, [int]$Lm.MaxCandidates)))
+        $top = @($scored | Sort-Object @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { [int64]$_.Conf.id } } | Select-Object -First $perDevTop)
         if ($top.Count -eq 0 -or ($top[0].Sim -lt [double]$Lm.MinNameSimilarity -and -not $top[0].Mac)) {
             # Nothing looks remotely like it: a new device. Not worth a question.
             $stats.aiNotAsked++
             $null = & $planDevice $c $null ''
             continue
         }
-        $dev = [ordered]@{ name = $c.Name }
-        foreach ($p in @(@('hostname', $c.Hostname), @('serial', $c.Serial), @('manufacturer', $a.manufacturer), @('model', $a.model), @('os', $(if ($a.os) { $a.os } else { $c.OsFallback })), @('mac', $a.mac), @('n_central_class', $c.Class), @('it_glue_type', $c.Type), @('site', (Get-Attr $c.Loc 'name')))) {
-            $v = Get-ShortText $p[1] 80; if ($v) { $dev[$p[0]] = $v }
+        $null = $aiItems.Add(@{ C = $c; A = $a; Top = $top })
+    }
+
+    if (-not $batchMode) {
+        foreach ($it in $aiItems) {
+            $c = $it.C; $a = $it.A; $top = $it.Top
+            $dev = [ordered]@{ name = $c.Name }
+            foreach ($p in @(@('hostname', $c.Hostname), @('serial', $c.Serial), @('manufacturer', $a.manufacturer), @('model', $a.model), @('os', $(if ($a.os) { $a.os } else { $c.OsFallback })), @('mac', $a.mac), @('n_central_class', $c.Class), @('it_glue_type', $c.Type), @('site', (Get-Attr $c.Loc 'name')))) {
+                $v = Get-ShortText $p[1] 80; if ($v) { $dev[$p[0]] = $v }
+            }
+            $cl = @($top | ForEach-Object { Get-ConfFacts $_.Conf })
+            $prompt = "N-central device:`n$(ConvertTo-Json -InputObject $dev -Depth 3 -Compress)`n`nIT Glue configurations at the same customer ($(Get-Attr $c.Org 'name')) and location ($(Get-Attr $c.Loc 'name')) or with no location, archived ones left out:`n$(ConvertTo-Json -InputObject $cl -Depth 3 -Compress)"
+            $ids = @($top | ForEach-Object { [string]$_.Conf.id })
+            $validate = {
+                param($o, $ids)
+                if (-not $o.PSObject.Properties['match_id'] -or -not $o.PSObject.Properties['confidence']) { throw 'match_id or confidence is missing' }
+                $mid = ([string]$o.match_id).Trim()
+                if (@('none', 'null', '0', 'n/a') -contains $mid.ToLowerInvariant()) { $mid = '' }
+                if ($mid -and $ids -notcontains $mid) { throw "match_id '$mid' is not one of the candidates" }
+                $cf = ConvertTo-Confidence $o.confidence
+                if (-not $mid) { $cf = 0 }
+                return @{ match_id = $mid; confidence = $cf; reason = (Get-ShortText $o.reason 300) }
+            }
+            $r = Get-AiAnswer -Kind 'match' -Subject "N-central $($c.Id) $($c.Name)" -System $AiMatchSystem -Prompt $prompt -Schema $AiMatchSchema -Validate $validate -Context $ids
+            if ($r.status -ne 'ok') { & $noAnswer $c $r; continue }
+            $mid = [string]$r.answer.match_id
+            $pick = $null; if ($mid) { foreach ($t in $top) { if ([string]$t.Conf.id -eq $mid) { $pick = $t.Conf } } }
+            $null = & $decide $c $pick $mid ([int]$r.answer.confidence) ([string]$r.answer.reason) $r ''
         }
-        $cl = @($top | ForEach-Object { Get-ConfFacts $_.Conf })
-        $prompt = "N-central device:`n$(ConvertTo-Json -InputObject $dev -Depth 3 -Compress)`n`nIT Glue configurations at the same customer ($(Get-Attr $c.Org 'name')) and location ($(Get-Attr $c.Loc 'name')) or with no location, archived ones left out:`n$(ConvertTo-Json -InputObject $cl -Depth 3 -Compress)"
-        $ids = @($top | ForEach-Object { [string]$_.Conf.id })
-        $validate = {
-            param($o, $ids)
-            if (-not $o.PSObject.Properties['match_id'] -or -not $o.PSObject.Properties['confidence']) { throw 'match_id or confidence is missing' }
-            $mid = ([string]$o.match_id).Trim()
-            if (@('none', 'null', '0', 'n/a') -contains $mid.ToLowerInvariant()) { $mid = '' }
-            if ($mid -and $ids -notcontains $mid) { throw "match_id '$mid' is not one of the candidates" }
-            $cf = ConvertTo-Confidence $o.confidence
-            if (-not $mid) { $cf = 0 }
-            return @{ match_id = $mid; confidence = $cf; reason = (Get-ShortText $o.reason 300) }
+    } else {
+        # One CSV pair per customer under ai-batches\<run>\ (also the audit trail), then one question
+        # per chunk of up to BatchSize devices. Chunks are split again if the prompt is too long.
+        $batchRoot = Join-Path $DataFolder 'ai-batches'
+        try {
+            $cut = (Get-Date).AddDays(-[int]$Cfg.LogRetentionDays)
+            if (Test-Path -LiteralPath $batchRoot) { Get-ChildItem -LiteralPath $batchRoot -Directory | Where-Object { $_.LastWriteTime -lt $cut } | Remove-Item -Recurse -Force }
+        } catch { Write-Log "Couldn't clean up old AI batch files: $($_.Exception.Message)" 'WARN' }
+        $batchDir = Join-Path $batchRoot ("{0}-{1}" -f (Get-Date -Format 'yyyyMMdd'), $RunId)
+        $size = [math]::Max(1, [int]$Lm.BatchSize)
+        $maxCtx = [math]::Max([int]$Lm.ContextTokens, [int]$Lm.MaxContextTokens)
+        $byOrg = @{}
+        foreach ($it in $aiItems) { if (-not $byOrg.ContainsKey($it.C.OrgId)) { $byOrg[$it.C.OrgId] = New-Object System.Collections.ArrayList }; $null = $byOrg[$it.C.OrgId].Add($it) }
+        foreach ($oid in @($byOrg.Keys | Sort-Object)) {
+            $items = @($byOrg[$oid] | Sort-Object @{ Expression = { Get-Attr $_.C.Loc 'name' } }, @{ Expression = { $_.C.Name } })
+            $orgName = Get-Attr $items[0].C.Org 'name'
+            $safe = (($orgName -replace '[^A-Za-z0-9 _-]', '') -replace '\s+', '_'); if ($safe.Length -gt 40) { $safe = $safe.Substring(0, 40) }
+            $devRows = @(); $confRows = @{}
+            $chunks = New-Object System.Collections.ArrayList
+            for ($i = 0; $i -lt $items.Count; $i += $size) { $null = $chunks.Add(@($items[$i..([math]::Min($i + $size, $items.Count) - 1)])) }
+            $results = New-Object System.Collections.ArrayList
+            $ci = 0
+            while ($ci -lt $chunks.Count) {
+                $chunk = @($chunks[$ci]); $ci++
+                $sent = [ordered]@{}   # config id -> conf, union of each device's top candidates
+                $allowed = @{}         # device id -> @{ config id = $true }
+                $dRows = New-Object System.Collections.ArrayList
+                foreach ($it in $chunk) {
+                    $c = $it.C; $a = $it.A
+                    $allowed[$c.Id] = @{}
+                    foreach ($t in $it.Top) { $xid = [string]$t.Conf.id; $allowed[$c.Id][$xid] = $true; if (-not $sent.Contains($xid)) { $sent[$xid] = $t.Conf } }
+                    $null = $dRows.Add([pscustomobject][ordered]@{ device_id = $c.Id; name = $c.Name; hostname = $c.Hostname; serial = $c.Serial; mac = [string]$a.mac; manufacturer = (Get-ShortText $a.manufacturer 40); model = (Get-ShortText $a.model 40); type = $c.Type; location = (Get-Attr $c.Loc 'name') })
+                }
+                $cRows = @(foreach ($xid in $sent.Keys) {
+                        $x = $sent[$xid]
+                        $upd = Get-Attr $x 'updated-at'; if ($upd.Length -ge 10) { $upd = $upd.Substring(0, 10) }
+                        [pscustomobject][ordered]@{ config_id = $xid; name = (Get-Attr $x 'name'); hostname = (Get-Attr $x 'hostname'); serial = (Get-Attr $x 'serial-number'); mac = (Get-Attr $x 'mac-address'); manufacturer = (Get-ShortText (Get-Attr $x 'manufacturer-name') 40); model = (Get-ShortText (Get-Attr $x 'model-name') 40); type = (Get-Attr $x 'configuration-type-name'); location = (Get-Attr $x 'location-name'); status = (Get-Attr $x 'configuration-status-name'); last_updated = $upd }
+                    })
+                $dCsv = (@($dRows | ConvertTo-Csv -NoTypeInformation) -join "`n")
+                $cCsv = (@($cRows | ConvertTo-Csv -NoTypeInformation) -join "`n")
+                $prompt = "Customer: $orgName`n`nN-central devices with no IT Glue record yet (CSV):`n$dCsv`n`nIT Glue configurations at this customer that no device is linked to, archived ones left out (CSV):`n$cCsv`n`nReturn one entry in matches for every device_id above."
+                $estTokens = [int](($AiBatchSystem.Length + $prompt.Length) / 3) + 80 * $chunk.Count + 300
+                if ($estTokens -gt $maxCtx -and $chunk.Count -gt 1) {
+                    # Too long for the model's context: split this chunk in two and try again.
+                    $half = [int][math]::Ceiling($chunk.Count / 2)
+                    $null = $chunks.Insert($ci, @($chunk[$half..($chunk.Count - 1)])); $null = $chunks.Insert($ci, @($chunk[0..($half - 1)]))
+                    continue
+                }
+                $numCtx = [math]::Min($maxCtx, [math]::Max([int]$Lm.ContextTokens, $estTokens))
+                $devRows += @($dRows); foreach ($cr in $cRows) { $confRows[$cr.config_id] = $cr }
+                $validate = {
+                    param($o, $allowed)
+                    if (-not $o.PSObject.Properties['matches']) { throw 'matches is missing' }
+                    $rows = @{}; $bad = 0
+                    foreach ($m in @($o.matches)) {
+                        if ($null -eq $m) { continue }
+                        $did = ([string]$m.device_id).Trim()
+                        if (-not $allowed.ContainsKey($did) -or $rows.ContainsKey($did)) { $bad++; continue }
+                        $mid = ([string]$m.match_id).Trim()
+                        if (@('none', 'null', '0', 'n/a') -contains $mid.ToLowerInvariant()) { $mid = '' }
+                        if ($mid -and -not $allowed[$did].ContainsKey($mid)) { $bad++; continue }   # not one this device may match
+                        $cf = 0; try { $cf = ConvertTo-Confidence $m.confidence } catch { $bad++; continue }
+                        if (-not $mid) { $cf = 0 }
+                        $rows[$did] = @{ match_id = $mid; confidence = $cf; reason = (Get-ShortText $m.reason 300) }
+                    }
+                    if ($rows.Count -eq 0) { throw 'no usable rows' }
+                    if ($bad -gt [math]::Max(2, [int]($allowed.Count / 2))) { throw "$bad of the rows were invalid" }
+                    return @{ rows = $rows; bad = $bad }
+                }
+                $r = Get-AiAnswer -Kind 'batch' -Subject "$orgName ($($chunk.Count) devices, $($cRows.Count) records)" -System $AiBatchSystem -Prompt $prompt -Schema $AiBatchSchema -Validate $validate -Context $allowed -NumCtx $numCtx
+                if ($r.status -ne 'ok') { foreach ($it in $chunk) { & $noAnswer $it.C $r; $null = $results.Add([pscustomobject][ordered]@{ device_id = $it.C.Id; device = $it.C.Name; config_id = ''; config = ''; confidence = ''; action = $r.status; reason = [string]$r.why }) }; continue }
+                $rows = $r.answer.rows
+                # The same configuration picked for two devices in one answer: hold both for a person.
+                $picks = @{}
+                foreach ($did in @($rows.Keys)) { $m = [string]$rows[$did].match_id; if ($m -and [int]$rows[$did].confidence -ge [int]$Lm.ReviewConfidence) { $picks[$m] = 1 + [int]$picks[$m] } }
+                foreach ($it in $chunk) {
+                    $c = $it.C
+                    $row = $rows[$c.Id]
+                    if ($row -isnot [hashtable]) {
+                        & $noAnswer $c @{ status = 'error'; why = 'the model left this device out of its answer (or gave an invalid row)' }
+                        $null = $results.Add([pscustomobject][ordered]@{ device_id = $c.Id; device = $c.Name; config_id = ''; config = ''; confidence = ''; action = 'no answer'; reason = '' })
+                        continue
+                    }
+                    $mid = [string]$row.match_id
+                    $pick = $null; if ($mid) { $pick = $sent[$mid] }
+                    $note = ''; if ($mid -and [int]$picks[$mid] -gt 1) { $note = "The model matched IT Glue configuration $mid to more than one device." }
+                    $act = & $decide $c $pick $mid ([int]$row.confidence) ([string]$row.reason) $r $note
+                    $null = $results.Add([pscustomobject][ordered]@{ device_id = $c.Id; device = $c.Name; config_id = $mid; config = $(if ($pick) { Get-Attr $pick 'name' } else { '' }); confidence = [int]$row.confidence; action = $act; reason = [string]$row.reason })
+                }
+            }
+            try {
+                $null = [IO.Directory]::CreateDirectory($batchDir)
+                $base = Join-Path $batchDir "$oid-$safe"
+                if ($devRows.Count) { $devRows | Export-Csv -LiteralPath "$base-devices.csv" -NoTypeInformation -Encoding UTF8 }
+                if ($confRows.Count) { @($confRows.Values) | Export-Csv -LiteralPath "$base-configs.csv" -NoTypeInformation -Encoding UTF8 }
+                if ($results.Count) { $results | Export-Csv -LiteralPath "$base-results.csv" -NoTypeInformation -Encoding UTF8 }
+            } catch { Write-Log "Couldn't write the AI batch files for $orgName to $batchDir : $($_.Exception.Message)" 'WARN' }
         }
-        $r = Get-AiAnswer -Kind 'match' -Subject "N-central $($c.Id) $($c.Name)" -System $AiMatchSystem -Prompt $prompt -Schema $AiMatchSchema -Validate $validate -Context $ids
-        if ($r.status -eq 'deferred') {
-            # Not created this run, so a duplicate can't slip in; asked on the next run.
-            $stats.aiDeferred++; $orgsHeld[$c.OrgId] = $true
-            continue
-        }
-        if ($r.status -eq 'error') {
-            $stats.aiErrors++; $orgsHeld[$c.OrgId] = $true
-            Write-Log "Local AI couldn't check $($c.CustName) | $($c.Name), so it is matched without it: $($r.why)" 'WARN'
-            $null = & $planDevice $c $null ''
-            continue
-        }
-        if ($r.cached) { $stats.aiCached++ } else { $stats.aiAsked++ }
-        $ans = $r.answer
-        $mid = [string]$ans.match_id; $cf = [int]$ans.confidence
-        $pick = $null
-        if ($mid) { foreach ($t in $top) { if ([string]$t.Conf.id -eq $mid) { $pick = $t.Conf } } }
-        if ($pick -and $claimed.ContainsKey($mid)) { $pick = $null }   # taken by another device meanwhile
-        $action = 'none'
-        if ($pick -and $Lm.AutoLink -eq $true -and $cf -ge [int]$Lm.AutoLinkConfidence) {
-            $action = 'link'; $stats.aiLinked++
-            Write-Log "Local AI: $($c.CustName) | $($c.Name) is IT Glue '$(Get-Attr $pick 'name')' (id $mid), confidence $cf. $($ans.reason)"
-            $claimed[$mid] = $c.Id
-            $null = & $planDevice $c $pick 'ai'
-        } elseif ($pick -and $cf -ge [int]$Lm.ReviewConfidence) {
-            $action = 'review'; $stats.aiReview++; $aiSuggested[$mid] = $true; $orgsHeld[$c.OrgId] = $true
-            Add-Failure 'AiReview' "aimatch:$($c.Id)" $c.CustName $c.Name ("Not created or linked: possibly the same device as IT Glue configuration '{0}' (id {1}), confidence {2}. {3} To accept, add `"{4}`": `"{1}`" to LocalModel.ApprovedMatches in the config. If it's a different device, add the same line to LocalModel.RejectedMatches." -f (Get-Attr $pick 'name'), $mid, $cf, $ans.reason, $c.Id) (Get-Attr $pick 'resource-url')
-        } else {
-            $stats.aiNoMatch++
-            $null = & $planDevice $c $null ''
-        }
-        $d = [ordered]@{ kind = 'match'; action = $action; ncId = $c.Id; device = $c.Name; customer = $c.CustName; itgId = $mid; itgName = $(if ($pick) { Get-Attr $pick 'name' } else { '' }); confidence = $cf; reason = [string]$ans.reason; cached = [bool]$r.cached }
-        $null = $aiDecisions.Add($d)
-        Write-AiAudit @{ type = 'decision'; kind = 'match'; action = $action; ncId = $c.Id; device = $c.Name; customer = $c.CustName; itgId = $mid; confidence = $cf; reason = [string]$ans.reason; cached = [bool]$r.cached; key = $r.key; apply = [bool]$Apply }
+        if ($aiItems.Count) { Write-Log "Local AI batch files (devices, configurations and results per customer): $batchDir" }
     }
 
     & $markPhase 'local AI matching'
@@ -1836,7 +1984,7 @@ function Invoke-Main {
 
     # Save links even when some writes failed, so created configurations aren't created again.
     if (-not $DryRun -and -not $runError) {
-        try { Save-JsonFile -Path $SyncStatePath -Obj $Sync -Depth 5 -Compress }
+        try { Save-JsonFile -Path $SyncStatePath -Obj $Sync -Depth 9 -Compress }
         catch { Write-Log "Couldn't save $SyncStatePath : $($_.Exception.Message)" 'ERROR' }
     }
 
