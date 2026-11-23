@@ -132,7 +132,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.4'
+$ScriptVersion = '0.5'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -429,10 +429,42 @@ function Read-SyncState {
     return $st
 }
 
+# The lock is an open file handle, which Windows releases when the process ends (even after a crash
+# or a reboot), so a lock file left on disk is never "stale" by itself. Only a sharing violation
+# means another run really has it open; any other error (usually access denied because a different
+# account created the file) is reported as what it is, and the old file is removed if possible.
 $lockPath = Join-Path $DataFolder 'sync.lock'
 $lock = $null
-try { $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-catch { Write-Log 'Another run is still in progress (lock file is held). Skipping this run.' 'WARN'; exit $EXIT_OK }
+$runAs = "$env:USERDOMAIN\$env:USERNAME"
+try { $runAs = [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { }
+function Open-RunLock {
+    return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)
+}
+function Get-InnerException { param($E) $x = $E; while ($x -is [Management.Automation.MethodInvocationException] -and $x.InnerException) { $x = $x.InnerException }; return $x }
+function Test-SharingViolation { param($E) $code = $E.HResult -band 0xFFFF; return ($E -is [IO.IOException] -and ($code -eq 32 -or $code -eq 33)) }
+try { $lock = Open-RunLock }
+catch {
+    $ex = Get-InnerException $_.Exception
+    if (Test-SharingViolation $ex) {
+        $holder = ''
+        try { $fs = [IO.File]::Open($lockPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite); $sr = New-Object IO.StreamReader($fs); $holder = $sr.ReadToEnd().Trim(); $sr.Dispose() } catch { }
+        Write-Log "Another run is still in progress: $lockPath is open$(if ($holder) { " ($holder)" }). Skipping this run." 'WARN'
+        exit $EXIT_OK
+    }
+    # Not another run. Most likely the file was made by another account and this one can't write it.
+    Write-Log "Lock file $lockPath can't be opened by ${runAs}: $($ex.Message) This is NOT another run. Removing the old lock file and trying again." 'WARN'
+    try { Remove-Item -LiteralPath $lockPath -Force -ErrorAction Stop; $lock = Open-RunLock }
+    catch {
+        Write-Log "Couldn't remove or reopen $lockPath as ${runAs}: $((Get-InnerException $_.Exception).Message) Delete that file in an admin window (no run needs it while none is going), and check that this account can write to $DataFolder (SETUP-INSTRUCTIONS Part 4.2)." 'ERROR'
+        exit $EXIT_ERROR
+    }
+    Write-Log "Old lock file removed; continuing."
+}
+try {
+    # Who holds the lock, for the message a second run shows.
+    $info = [Text.Encoding]::UTF8.GetBytes("PID $PID, $runAs, started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+    $lock.SetLength(0); $lock.Write($info, 0, $info.Length); $lock.Flush()
+} catch { }
 
 $State = Read-State
 $Sync = Read-SyncState

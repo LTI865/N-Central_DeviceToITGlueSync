@@ -4,7 +4,7 @@ Step-by-step guide to installing and configuring the N-central to IT Glue device
 sync computer. You don't need to know anything about the script beforehand. Do the parts in order
 and don't skip the tests.
 
-> **Status:** version 0.4. The script has **not been fully tested against live N-central and
+> **Status:** version 0.5. The script has **not been fully tested against live N-central and
 > IT Glue yet.** That is why setup goes through a dry run, then a one-device test, then a
 > report-only task, before it is allowed to change anything.
 
@@ -573,7 +573,8 @@ Shown at the end of every run (`Finished with exit code N`) and as `LastTaskResu
 | `Config file ... is not valid JSON` | Typo in the config | Run the check in Part 4.3, step 3 |
 | `Can't create '...\logs'` | The service account can't write to the data folder | Part 4.2 (`icacls ... /grant ...:(OI)(CI)M`) |
 | `Run this from an elevated PowerShell` | Registering the task from a normal window | Use the admin window |
-| `Another run is still in progress` | The task and a manual run overlapped | Wait for the other run to finish; it's harmless |
+| `Another run is still in progress: ...sync.lock is open (PID ..., account, started ...)` | The task and a manual run overlapped | Wait for the other run to finish; it's harmless. The message names the process that holds it |
+| `Lock file ...sync.lock can't be opened by ...: Access to the path ... is denied` | The lock file was made by a different account (for example a run in the admin window, then one as the service account). Not another run | The script removes it and carries on. If it says it couldn't remove it, delete `C:\ProgramData\NCentralITGlueDeviceSync\sync.lock` in the admin window and check Part 4.2. Up to v0.4 this showed as "Another run is still in progress" by mistake |
 | `running scripts is disabled on this system` | Execution policy | Open the window with `-ExecutionPolicy Bypass` (as in Part 5) and run `Unblock-File` (Part 4.1) |
 | `runas` says `Logon failure` | Wrong password, or the account is disabled | Check the account in Computer Management > Local Users and Groups |
 | Task never runs, `LastTaskResult` 2147943785 | The service account lacks **Log on as a batch job** | Add it in `secpol.msc` > Local Policies > User Rights Assignment |
