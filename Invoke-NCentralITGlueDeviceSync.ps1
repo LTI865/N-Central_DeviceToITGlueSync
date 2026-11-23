@@ -134,7 +134,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '0.10'
+$ScriptVersion = '0.11'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $EXIT_OK = 0; $EXIT_FAILED = 1; $EXIT_ERROR = 2; $EXIT_NOTIFY_FAILED = 3; $EXIT_WRITE_FAILED = 4
@@ -779,7 +779,7 @@ function Find-ITGlueDuplicateNow {
     foreach ($q in $queries) {
         $r = Invoke-ITGlueGet -Uri "$BaseUrl/configurations?$q&filter[archived]=false&page[size]=50"
         foreach ($x in @($r.data | Where-Object { $_ })) {
-            if ((Get-Attr $x 'archived') -eq 'True') { continue }
+            if ((Test-Archived $x) -or $script:ArchivedConfigIds.ContainsKey([string]$x.id)) { continue }   # archived: ignored, never a duplicate
             # Compare exactly here, in case IT Glue's filter matches partly.
             $sameSerial = $Serial -and (Get-Attr $x 'organization-id') -eq $OrgId -and (Get-SerialKey (Get-Attr $x 'serial-number')) -eq (Get-SerialKey $Serial)
             $sameName = (Get-Attr $x 'organization-id') -eq $OrgId -and (($names -contains (Get-NameKey (Get-Attr $x 'name'))) -or ((Get-Attr $x 'hostname') -and $names -contains (Get-NameKey (Get-Attr $x 'hostname'))))
@@ -788,6 +788,26 @@ function Find-ITGlueDuplicateNow {
     }
     return ((@($found | Select-Object -Unique)) -join '; ')
 }
+# True when IT Glue marks the record as archived, whichever way it says it: an "archived" field
+# that is true (boolean, "true", "1", "yes"), or an "archived-at" date that is filled in. (Same as
+# the IT Glue duplicate-configurations tool.) Up to v0.10 only archived = "True" was checked.
+function Test-Archived {
+    param($Rec)
+    if (-not $Rec -or -not $Rec.attributes) { return $false }
+    foreach ($p in 'archived', 'is-archived', 'is_archived') {
+        if ($Rec.attributes.PSObject.Properties[$p]) {
+            $v = $Rec.attributes.$p
+            if ($v -is [bool]) { if ($v) { return $true } }
+            elseif ("$v".Trim() -match '^(true|1|yes)$') { return $true }
+        }
+    }
+    foreach ($p in 'archived-at', 'archived_at') {
+        if ($Rec.attributes.PSObject.Properties[$p] -and "$($Rec.attributes.$p)".Trim() -ne '') { return $true }
+    }
+    return $false
+}
+function Get-FieldList { param($Obj) if (-not $Obj) { return '(none)' } return (($Obj.PSObject.Properties | ForEach-Object { $_.Name }) -join ', ') }
+$script:ArchivedConfigIds = @{}   # ids on IT Glue's archived list (filter[archived]=true), filled when IT Glue is read
 function Get-NameKey { param([string]$S) return ($S -replace '\s+', ' ').Trim().ToLowerInvariant() }
 function Get-SerialKey { param([string]$S) return ($S -replace '\s+', '').ToUpperInvariant() }
 function Get-TextHash {
@@ -1254,8 +1274,41 @@ function Invoke-DeviceSync {
     # changed. N-central is the source of truth for devices; an archived IT Glue record doesn't count.
     # Assign first: Get-ITGlueAll returns its list as ONE object (return , $array), so piping the call
     # straight into Where-Object would filter the whole list as a single item (v0.3/v0.4 bug).
+    # Archived configurations must never be used, so three checks, in case IT Glue ignores one:
+    #   1. IT Glue is asked for filter[archived]=false.
+    #   2. Every record that still says it is archived (Test-Archived) is dropped.
+    #   3. IT Glue's archived list (filter[archived]=true) is read and every id on it is dropped.
+    # If IT Glue ignores the filter AND sends no archived field, there's no way to tell, and the run stops.
     $allConfs = Get-ITGlueAll '/configurations?filter[archived]=false'
-    $confs = @($allConfs | Where-Object { (Get-Attr $_ 'archived') -ne 'True' })
+    $archivedIds = @{}; $archListOk = $false; $archNote = ''
+    try {
+        $archList = Get-ITGlueAll '/configurations?filter[archived]=true'
+        $allIds = @{}; foreach ($c in $allConfs) { $allIds[[string]$c.id] = $true }
+        $overlap = 0; foreach ($c in $archList) { if ($allIds.ContainsKey([string]$c.id)) { $overlap++ } }
+        if ($archList.Count -gt 0 -and $overlap -eq $archList.Count -and $archList.Count -eq $allConfs.Count) {
+            $archNote = 'IT Glue returned the same list for archived=true and archived=false, so its archived filter is ignored; only the archived field on each record is used'
+            Write-Log "$archNote." 'WARN'
+        } else {
+            foreach ($c in $archList) { $archivedIds[[string]$c.id] = $true }
+            $archListOk = $true
+            $archNote = "IT Glue's archived list has $($archList.Count) configuration(s), $overlap of them also in the not-archived answer"
+        }
+        $archList = $null
+    } catch { $archNote = "IT Glue's archived list couldn't be read ($($_.Exception.Message)); only the archived field on each record is used"; Write-Log "$archNote." 'WARN' }
+    $archFields = @()
+    foreach ($c in $allConfs) { if ($c.attributes) { foreach ($f in 'archived', 'is-archived', 'is_archived', 'archived-at', 'archived_at') { if ($c.attributes.PSObject.Properties[$f] -and $archFields -notcontains $f) { $archFields += $f } } }; if ($archFields.Count) { break } }
+    if ($allConfs.Count -gt 0 -and $archFields.Count -eq 0 -and -not $archListOk) {
+        throw "Can't tell archived IT Glue configurations from active ones: IT Glue sent no 'archived' field and its archived list couldn't be used. Stopping so archived records are not used. Fields IT Glue sent: $(Get-FieldList $allConfs[0].attributes)"
+    }
+    $script:ArchivedConfigIds = $archivedIds
+    $byField = 0; $byList = 0
+    $confs = @(foreach ($c in $allConfs) {
+            if (Test-Archived $c) { $byField++; continue }
+            if ($archivedIds.ContainsKey([string]$c.id)) { $byList++; continue }
+            $c
+        })
+    $allConfs = $null
+    Write-Log ("IT Glue configurations: {0} kept, {1} archived dropped ({2} marked archived on the record, {3} on IT Glue's archived list). Archived field IT Glue sends: {4}. {5}." -f $confs.Count, ($byField + $byList), $byField, $byList, $(if ($archFields.Count) { $archFields -join ', ' } else { 'none' }), $archNote)
     foreach ($c in $confs) { if ([string]$c.id -notmatch '^\d+$') { throw "IT Glue configuration list was read wrongly (an entry has id '$([string]$c.id)'). Nothing was changed." } }
     $types = Get-ITGlueAll '/configuration_types'
     $statuses = Get-ITGlueAll '/configuration_statuses'
@@ -1320,7 +1373,7 @@ function Invoke-DeviceSync {
     $confById = @{}; $confsBySerial = @{}; $confsByOrgName = @{}; $confsByOrg = @{}
     $orgsHeld = @{}   # organizations with devices that couldn't be matched this run (no archive suggestions there)
     foreach ($c in $confs) {
-        if ((Get-Attr $c 'archived') -eq 'True') { continue }
+        if (Test-Archived $c) { continue }
         $confById[[string]$c.id] = $c
         $coid = Get-Attr $c 'organization-id'
         if (-not $confsByOrg.ContainsKey($coid)) { $confsByOrg[$coid] = New-Object System.Collections.ArrayList }
